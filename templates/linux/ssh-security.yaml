@@ -1,0 +1,210 @@
+# Template: Linux SSH Key and Config Parsing
+# Platform: linux
+# Use when: Detecting SSH private keys, parsing authorized_keys, or auditing SSH security posture
+
+# =============================================================================
+# Based on: Linux.Ssh.PrivateKeys, Linux.Ssh.AuthorizedKeys
+#
+# Patterns demonstrated:
+#   A. Private key detection with multi-format classification using switch()
+#      - parse_binary() with custom profile for OpenSSH binary format
+#      - base64decode() to extract key data from PEM headers
+#      - LocalFilesystemOnly with DevMajor recursion_callback for glob()
+#   B. authorized_keys parsing with commandline_split(bash_style=TRUE)
+#      - Handles quoted options like from="*.example.com" ssh-rsa AAAA...
+#      - Distinguishes between entries with and without options prefix
+#
+# Key security findings:
+#   - Cipher = "none" indicates an UNENCRYPTED private key (high risk)
+#   - authorized_keys with options may restrict or grant specific access
+#   - SSH keys without corresponding .pub files may be orphaned
+#
+# LocalFilesystemOnly pattern:
+#   Uses device major numbers to stay on physical disks.
+#   Avoids /proc, NFS, FUSE mounts. Controlled via DevMajor IN list.
+# =============================================================================
+
+name: Linux.Ssh.ArtifactName           # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what SSH data this artifact collects.
+
+  Describe: whether private keys, authorized_keys, or SSH config files are
+  parsed, what encryption/format detection is performed, and the security risk.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS From info() where OS =~ 'linux'
+
+parameters:
+  - name: KeyGlobs
+    description: Glob patterns to find SSH key files.
+    default: /home/*/.ssh/{*.pem,id_rsa,id_dsa,id_ecdsa,id_ed25519},/root/.ssh/{*.pem,id_*}
+    # For authorized_keys: /home/*/.ssh/authorized_keys,/root/.ssh/authorized_keys
+
+  - name: ExcludePathRegex
+    type: regex
+    description: Do not recurse into directories matching this regex.
+    default: "^/(proc|sys|run|snap)"
+
+  - name: LocalFilesystemOnly
+    type: bool
+    description: Stay on local filesystems only (avoids NFS, /proc, FUSE mounts).
+    default: Y
+
+  - name: KeyTypes
+    type: regex
+    description: Regex identifying valid SSH key types (for authorized_keys parsing).
+    default: "sk-ecdsa-sha2-nistp256|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|ssh-ed25519|ssh-dss|ssh-rsa"
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: SSH Private Key Detection and Format Classification
+      -- =====================================================================
+
+      -- OpenSSH binary format struct profile
+      -- Magic: "openssh-key-v1\0", cipher_length (uint32 big-endian), cipher name
+      LET SSHProfile = '''[
+        ["Header", 0, [
+          ["Magic", 0, "String", {"length": 100}],
+          ["cipher_length", 15, "uint32b"],
+          ["cipher", 19, "String", {"length": "x=>x.cipher_length"}]
+        ]]
+      ]'''
+
+      -- Device major numbers for local (non-virtual) filesystems
+      -- Virtual filesystems (/proc, NFS, FUSE) have major 0
+      LET LocalDeviceMajor <= (NULL,
+          253,  -- device-mapper
+          7,    -- loop devices
+          8,    -- SCSI disks (sd)
+          9,    -- RAID (md)
+          11,   -- SCSI CD-ROM (sr)
+          65, 66, 67, 68, 69, 70, 71,          -- extended SCSI
+          128, 129, 130, 131, 132, 133, 134, 135,
+          202,  -- Xen virtual disk (xvd)
+          254,  -- RAID partitions (mdp)
+          259)  -- block extended (blkext, NVMe)
+
+      -- Recursion callback: combine LocalFilesystemOnly and ExcludePathRegex
+      -- Passed to glob() to control directory recursion
+      LET RecursionCallback = if(
+        condition=LocalFilesystemOnly,
+        then=if(condition=ExcludePathRegex,
+               then="x=>x.Data.DevMajor IN LocalDeviceMajor AND NOT x.OSPath =~ ExcludePathRegex",
+               else="x=>x.Data.DevMajor IN LocalDeviceMajor"),
+        else=if(condition=ExcludePathRegex,
+               then="x=>NOT x.OSPath =~ ExcludePathRegex",
+               else=""))
+
+      -- Find candidate files: size < 20KB (SSH keys are small)
+      LET _Hits = SELECT OSPath,
+            read_file(filename=OSPath, length=20240) AS Data
+        FROM glob(globs=KeyGlobs, recursion_callback=RecursionCallback)
+        WHERE Size < 20000
+          AND log(message="Checking: %v", args=OSPath, dedup=-1)
+
+      -- Extract PEM header and base64 body from files
+      LET Hits = SELECT OSPath, Data,
+            base64decode(
+              string=parse_string_with_regex(
+                string=Data,
+                regex="(?sm)KEY-----(.+)-----END").g1) || "" AS Decoded,
+            parse_string_with_regex(
+              string=Data,
+              regex="(BEGIN.* PRIVATE KEY)").g1 AS Header,
+            read_file(filename=OSPath.Dirname + (OSPath.Basename + ".pub")) AS PublicKey
+        FROM _Hits
+        WHERE Header  -- Only files containing a private key header
+
+      -- Parse OpenSSH format cipher from binary data
+      LET OpenSSHKeyParser(OSPath, Decoded) = SELECT OSPath,
+          parse_binary(accessor="data", filename=Decoded,
+                       profile=SSHProfile, struct="Header") AS Parsed
+        FROM scope()
+
+      -- Classify each key using switch() — first matching branch wins
+      SELECT * FROM foreach(
+        row={SELECT * FROM Hits},
+        query={
+          SELECT * FROM switch(
+            a={
+              -- New OpenSSH format (magic: "openssh-key-v1")
+              SELECT OSPath,
+                     Parsed.Magic AS KeyType,
+                     Parsed.cipher AS Cipher,   -- "none" = UNENCRYPTED
+                     Header, PublicKey
+              FROM OpenSSHKeyParser(OSPath=OSPath, Decoded=Decoded)
+              WHERE Header =~ "BEGIN OPENSSH PRIVATE KEY"
+            },
+            a2={
+              -- Encrypted PEM RSA (Proc-Type header indicates encryption)
+              SELECT OSPath,
+                     "PKCS8" AS KeyType,
+                     parse_string_with_regex(string=Data,
+                       regex="DEK-Info: ([-a-zA-Z0-9]+)").g1 AS Cipher,
+                     Header, PublicKey
+              FROM scope()
+              WHERE Header =~ "BEGIN RSA PRIVATE KEY"
+                AND "Proc-Type: 4,ENCRYPTED" in Data
+            },
+            b={
+              -- Unencrypted PEM RSA/DSA key — HIGH RISK
+              SELECT OSPath,
+                     "PKCS8" AS KeyType,
+                     "none" AS Cipher,          -- No password protection
+                     Header, PublicKey
+              FROM scope()
+              WHERE Header =~ "BEGIN (RSA )?PRIVATE KEY"
+            },
+            c={
+              -- PKCS#5 encrypted format
+              SELECT OSPath,
+                     "PKCS8" AS KeyType,
+                     "PKCS#5" AS Cipher,
+                     Header, PublicKey
+              FROM scope()
+              WHERE Header =~ "BEGIN ENCRYPTED PRIVATE KEY"
+            },
+            d={
+              -- Unknown format catch-all
+              SELECT OSPath,
+                     "Unknown" AS KeyType,
+                     "Unknown" AS Cipher,
+                     Header, PublicKey
+              FROM scope()
+            })
+        })
+      -- TODO: Add WHERE Cipher = "none" to flag only unencrypted keys
+
+      -- =====================================================================
+      -- PATTERN B: authorized_keys Parsing with Bash-Style Command Splitting
+      -- Handles quoted options: from="*.example.com" ssh-rsa AAAA... comment
+      -- Uncomment to replace Pattern A above.
+      -- =====================================================================
+      -- LET ParseOptions(Opts) = split(string=Opts, sep_string=",")
+      --
+      -- -- Determine if first token is options or key type
+      -- LET ParseParts(Parts) = if(
+      --   condition=Parts[0] =~ KeyTypes,
+      --   -- No options: keytype base64key [comment]
+      --   then=dict(options="", keytype=Parts[0], base64key=Parts[1], comment=Parts[2] || ""),
+      --   -- Has options: options keytype base64key [comment]
+      --   else=dict(options=ParseOptions(Opts=Parts[0]),
+      --             keytype=Parts[1], base64key=Parts[2], comment=Parts[3] || ""))
+      --
+      -- LET Parse(OSPath) =
+      --   SELECT ParseParts(
+      --     Parts=commandline_split(command=Line, bash_style=TRUE) + ("", "", "", "")) AS Parsed
+      --   FROM parse_lines(filename=OSPath)
+      --   WHERE NOT Line =~ "^#"        -- Skip comment lines
+      --     AND Parsed.keytype =~ KeyTypes  -- Only lines with valid key types
+      --
+      -- SELECT * FROM foreach(
+      --   row={SELECT OSPath, Mtime, Ctime FROM glob(globs=KeyGlobs)},
+      --   query={
+      --     SELECT OSPath, *
+      --     FROM foreach(column="Parsed", row=Parse(OSPath=OSPath))
+      --   })
+      -- -- TODO: Filter WHERE options to detect overly permissive entries

@@ -1,0 +1,122 @@
+# Template: macOS SQLite Database Query
+# Platform: macos
+# Use when: Querying SQLite databases on macOS (TCC, QuarantineEvents, browser history)
+
+# =============================================================================
+# Based on: MacOS.System.TCC, MacOS.Applications.Chrome.History,
+#           MacOS.System.QuarantineEvents
+#
+# Patterns demonstrated:
+#   A. Simple SQLite query from glob-matched database files
+#   B. Comma-separated glob parameter with split()
+#   C. Timestamp conversion for SQLite epoch formats
+#
+# macOS SQLite timestamp formats:
+#   Unix epoch (standard):  timestamp(epoch=unix_col)
+#   Cocoa epoch (2001):     timestamp(cocoatime=cocoa_col)
+#   Chrome timestamps:      timestamp(winfiletime=chrome_col * 10)
+#   Mac absolute time:      timestamp(mactime=mac_col)
+#
+# Note: SQLite files may be locked by running applications.
+# The sqlite() plugin opens in read-only mode by default.
+# =============================================================================
+
+name: MacOS.Category.ArtifactName      # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what database data this artifact queries.
+
+  Describe: which SQLite database files are queried, what tables and
+  fields are accessed, and the forensic or operational value.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'darwin'
+
+parameters:
+  - name: DatabaseGlob
+    description: Glob pattern to find SQLite database files.
+    default: /Users/*/Library/Application Support/com.apple.TCC/TCC.db,/Library/Application Support/com.apple.TCC/TCC.db
+    # Common database paths:
+    #   TCC:              /Users/*/Library/Application Support/com.apple.TCC/TCC.db
+    #                     /Library/Application Support/com.apple.TCC/TCC.db
+    #   Chrome history:   /Users/*/Library/Application Support/Google/Chrome/*/History
+    #   Safari history:   /Users/*/Library/Safari/History.db
+    #   QuarantineEvents: /Users/*/Library/Preferences/com.apple.LaunchServices.QuarantineEventsV2
+
+  - name: SQLQuery
+    description: SQL query to execute against each database.
+    default: |
+      SELECT * FROM access LIMIT 1000
+    # TODO: Set the SQL query for your target table
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: Query SQLite databases found by glob
+      -- =====================================================================
+      SELECT * FROM foreach(
+        row={
+          -- Find database files, splitting comma-separated glob parameter
+          SELECT OSPath FROM glob(globs=split(string=DatabaseGlob, sep=","))
+        },
+        query={
+          -- Execute SQL query against each database
+          LET db_path = OSPath
+
+          SELECT *,
+                 -- Extract username from per-user paths:
+                 parse_string_with_regex(
+                   regex="/Users/(?P<User>[^/]+)",
+                   string=str(str=db_path)).User AS Username,
+                 db_path AS DatabasePath
+          FROM sqlite(file=db_path, query=SQLQuery)
+        })
+
+      -- =====================================================================
+      -- PATTERN B: TCC-style query with column aliasing and user extraction
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT OSPath FROM glob(globs=split(string=DatabaseGlob, sep=","))},
+      --   query={
+      --     SELECT client AS Application,
+      --            service AS PrivacyService,
+      --            auth_value AS AuthValue,
+      --            last_modified AS _LastModifiedRaw,
+      --            timestamp(epoch=last_modified) AS LastModified,
+      --            -- User extraction based on path
+      --            if(condition=OSPath =~ "Users",
+      --              then=path_split(path=OSPath)[-5],
+      --              else="System") AS Username,
+      --            OSPath AS DatabasePath
+      --     FROM sqlite(
+      --       file=OSPath,
+      --       query="SELECT client, service, auth_value, last_modified FROM access")
+      --   })
+
+      -- =====================================================================
+      -- PATTERN C: Browser history with Chrome timestamp conversion
+      -- Chrome stores timestamps as microseconds since Jan 1, 1601 (Windows epoch)
+      -- Convert: timestamp(winfiletime=last_visit_time * 10)
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT OSPath FROM glob(globs=HistoryGlob)},
+      --   query={
+      --     SELECT url AS URL,
+      --            title AS Title,
+      --            visit_count AS VisitCount,
+      --            timestamp(winfiletime=last_visit_time * 10) AS LastVisit,
+      --            parse_string_with_regex(
+      --              regex="/Users/(?P<User>[^/]+)", string=OSPath).User AS Username
+      --     FROM sqlite(
+      --       file=OSPath,
+      --       query="SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC")
+      --   })
+
+column_types:
+  - name: LastModified
+    type: timestamp
+  - name: LastVisit
+    type: timestamp

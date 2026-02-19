@@ -1,0 +1,238 @@
+# Template: Linux Syslog and Journald Parsing
+# Platform: linux
+# Use when: Parsing systemd binary journal logs or text-based syslog files
+
+# =============================================================================
+# Based on: Linux.Forensics.Journal, Linux.Syslog.SSHLogin,
+#           Linux.Events.SSHLogin, Linux.Events.SSHBruteforce
+#
+# Patterns demonstrated:
+#   A. parse_journald() with time range and identifier filtering
+#   B. Conditional filtering with IdentifierRegex and IocRegex (nested if())
+#   C. grok() for structured text syslog parsing (auth.log, secure)
+#   D. watch_journald() / watch_syslog() for CLIENT_EVENT monitoring
+#
+# When to use each approach:
+#   - Modern systems (systemd): parse_journald() on .journal binary files
+#   - Legacy / non-systemd: grok() on /var/log/auth.log, /var/log/secure
+#   - Real-time monitoring: watch_journald() or watch_syslog() (CLIENT_EVENT)
+#
+# Grok common patterns:
+#   %{SYSLOGTIMESTAMP:Timestamp}  — standard syslog timestamp
+#   %{SYSLOGHOST:logsource}       — hostname
+#   %{SYSLOGPROG:program}         — program name and optional PID
+#   %{GREEDYDATA:message}         — rest of line
+# =============================================================================
+
+name: Linux.Forensics.ArtifactName     # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what log data this artifact collects.
+
+  Describe: which log sources are parsed (journald binary files, syslog text),
+  what identifiers or events are targeted, and the forensic value.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'linux'
+
+parameters:
+  - name: JournalGlob
+    type: glob
+    description: Glob pattern to find binary systemd journal files.
+    default: /{run,var}/log/journal/*/*.journal
+
+  - name: SyslogGlob
+    description: Glob pattern for text-based syslog files (Debian and RHEL paths).
+    default: /var/log/{auth.log,secure}*
+
+  - name: IdentifierRegex
+    type: regex
+    description: Filter journal events by SYSLOG_IDENTIFIER (e.g., sshd, sudo, kernel).
+    # default: sshd
+
+  - name: IocRegex
+    type: regex
+    description: Filter events containing this IOC pattern in event data.
+    # default: 192\.168\.1\.100
+
+  - name: DateAfter
+    type: timestamp
+    description: Search for events after this date. Format YYYY-MM-DDTHH:mm:ssZ
+
+  - name: DateBefore
+    type: timestamp
+    description: Search for events before this date. Format YYYY-MM-DDTHH:mm:ssZ
+
+  - name: SyslogGrok
+    description: Grok expression for parsing text syslog entries.
+    # Customize for your specific log format. Common patterns:
+    # %{SYSLOGTIMESTAMP}, %{SYSLOGHOST}, %{SYSLOGPROG}, %{GREEDYDATA}
+    default: >-
+      %{SYSLOGTIMESTAMP:Timestamp} (?:%{SYSLOGFACILITY} )?%{SYSLOGHOST:logsource} %{SYSLOGPROG}: %{GREEDYDATA:message}
+
+  - name: AlsoUpload
+    type: bool
+    description: Upload raw log files for preservation.
+
+sources:
+  # ---------------------------------------------------------------------------
+  # PATTERN A & B: Binary Journal Logs — parse_journald() with conditional filters
+  # ---------------------------------------------------------------------------
+  - name: JournalLogs
+    query: |
+      -- Build sub-queries for each filter combination
+      -- parse_journald() accepts start_time/end_time for native time range filtering
+      LET standard = SELECT * FROM foreach(
+        row={SELECT OSPath FROM glob(globs=JournalGlob)},
+        query={
+          SELECT System.Timestamp AS Timestamp,
+                 EventData.SYSLOG_IDENTIFIER AS Identifier,
+                 EventData.MESSAGE AS Message,
+                 EventData._PID AS Pid,
+                 EventData._UID AS Uid,
+                 System._HOSTNAME AS Hostname,
+                 System._EXE AS Executable,
+                 System._CMDLINE AS CommandLine,
+                 OSPath AS JournalFile
+          FROM parse_journald(filename=OSPath,
+                              start_time=DateAfter,
+                              end_time=DateBefore)
+        })
+
+      LET identifier_only = SELECT * FROM foreach(
+        row={SELECT OSPath FROM glob(globs=JournalGlob)},
+        query={
+          SELECT System.Timestamp AS Timestamp,
+                 EventData.SYSLOG_IDENTIFIER AS Identifier,
+                 EventData.MESSAGE AS Message,
+                 EventData._PID AS Pid,
+                 EventData._UID AS Uid,
+                 System._HOSTNAME AS Hostname,
+                 System._EXE AS Executable,
+                 System._CMDLINE AS CommandLine,
+                 OSPath AS JournalFile
+          FROM parse_journald(filename=OSPath,
+                              start_time=DateAfter,
+                              end_time=DateBefore)
+          WHERE EventData.SYSLOG_IDENTIFIER =~ IdentifierRegex
+        })
+
+      LET ioc_only = SELECT * FROM foreach(
+        row={SELECT OSPath FROM glob(globs=JournalGlob)},
+        query={
+          SELECT System.Timestamp AS Timestamp,
+                 EventData.SYSLOG_IDENTIFIER AS Identifier,
+                 EventData.MESSAGE AS Message,
+                 EventData._PID AS Pid,
+                 EventData._UID AS Uid,
+                 System._HOSTNAME AS Hostname,
+                 System._EXE AS Executable,
+                 System._CMDLINE AS CommandLine,
+                 OSPath AS JournalFile
+          FROM parse_journald(filename=OSPath,
+                              start_time=DateAfter,
+                              end_time=DateBefore)
+          WHERE format(format='%s_%s_%s',
+                       args=[EventData, System._CMDLINE, System._EXE]) =~ IocRegex
+        })
+
+      LET all_regex = SELECT * FROM foreach(
+        row={SELECT OSPath FROM glob(globs=JournalGlob)},
+        query={
+          SELECT System.Timestamp AS Timestamp,
+                 EventData.SYSLOG_IDENTIFIER AS Identifier,
+                 EventData.MESSAGE AS Message,
+                 EventData._PID AS Pid,
+                 EventData._UID AS Uid,
+                 System._HOSTNAME AS Hostname,
+                 System._EXE AS Executable,
+                 System._CMDLINE AS CommandLine,
+                 OSPath AS JournalFile
+          FROM parse_journald(filename=OSPath,
+                              start_time=DateAfter,
+                              end_time=DateBefore)
+          WHERE EventData.SYSLOG_IDENTIFIER =~ IdentifierRegex
+            AND format(format='%s_%s_%s',
+                       args=[EventData, System._CMDLINE, System._EXE]) =~ IocRegex
+        })
+
+      -- Choose appropriate sub-query based on which filters were provided
+      SELECT * FROM if(
+        condition=IdentifierRegex AND IocRegex,
+        then=all_regex,
+        else=if(condition=IdentifierRegex,
+                then=identifier_only,
+                else=if(condition=IocRegex,
+                        then=ioc_only,
+                        else=standard)))
+
+  # ---------------------------------------------------------------------------
+  # PATTERN C: Text-based Syslog Files — grok() for legacy / non-systemd systems
+  # ---------------------------------------------------------------------------
+  - name: SyslogFiles
+    query: |
+      -- Parse text syslog files using Grok patterns
+      -- TODO: Customize Event field extraction based on your grok pattern
+      SELECT timestamp(string=Event.Timestamp) AS Time,
+             Event.logsource AS Host,
+             Event.program AS Program,
+             Event.message AS Message,
+             -- TODO: Add more Event.fieldname extractions based on your Grok pattern
+             -- Examples from SSH login parsing:
+             -- Event.event AS EventType,
+             -- Event.user AS User,
+             -- Event.ip AS SourceIP,
+             OSPath AS LogFile
+      FROM foreach(
+        row={SELECT OSPath FROM glob(globs=SyslogGlob)},
+        query={
+          SELECT grok(grok=SyslogGrok, data=Line) AS Event, OSPath
+          FROM parse_lines(filename=OSPath)
+          WHERE Event
+            AND if(condition=IdentifierRegex,
+                   then=Event.program =~ IdentifierRegex,
+                   else=TRUE)
+          -- TODO: Add additional WHERE conditions as needed
+        })
+
+  # ---------------------------------------------------------------------------
+  # PATTERN D: Real-time monitoring — use CLIENT_EVENT type
+  # Uncomment and change type: to CLIENT_EVENT above, replace sources above.
+  # ---------------------------------------------------------------------------
+  # - name: LiveJournal
+  #   query: |
+  #     -- watch_journald() monitors journal files in real-time (never terminates)
+  #     SELECT * FROM foreach(
+  #       row={SELECT OSPath FROM glob(globs=JournalGlob)},
+  #       workers=100,
+  #       query={SELECT * FROM watch_journald(filename=OSPath)})
+  #     WHERE if(condition=IdentifierRegex,
+  #              then=EventData.SYSLOG_IDENTIFIER =~ IdentifierRegex,
+  #              else=TRUE)
+
+  # - name: LiveSyslog
+  #   query: |
+  #     -- watch_syslog() monitors text syslog file in real-time
+  #     SELECT grok(grok=SyslogGrok, data=Line) AS Event
+  #     FROM watch_syslog(filename="/var/log/auth.log")
+  #     WHERE Event.program =~ IdentifierRegex
+
+  # ---------------------------------------------------------------------------
+  # Upload raw files when AlsoUpload is set
+  # ---------------------------------------------------------------------------
+  - name: Uploads
+    query: |
+      SELECT * FROM if(condition=AlsoUpload,
+        then={
+          SELECT OSPath, Size, Mtime, upload(file=OSPath) AS Upload
+          FROM glob(globs=[JournalGlob, SyslogGlob])
+        })
+
+column_types:
+  - name: Time
+    type: timestamp
+  - name: Timestamp
+    type: timestamp
+  - name: Upload
+    type: preview_upload

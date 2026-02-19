@@ -1,0 +1,127 @@
+# Template: Base Server Artifact
+# Platform: common
+# Use when: Starting any new SERVER or SERVER_EVENT artifact from scratch
+
+# =============================================================================
+# Server artifacts run on the Velociraptor server, not on endpoints.
+# They manage hunts, collect from clients, forward alerts, enrich data
+# via APIs, and schedule periodic tasks.
+#
+# Key differences from client artifacts:
+#   - NO OS precondition (server is always the execution context)
+#   - type: must be SERVER, SERVER_EVENT, or INTERNAL (always explicit)
+#   - SERVER_EVENT queries must NEVER terminate (use watch_monitoring/clock)
+#   - Credentials go in server_metadata(), with parameter fallback
+#   - Timestamps from clients() last_seen_at are in microseconds (÷ 1000000)
+#
+# For detailed patterns, read server.md.
+# =============================================================================
+
+name: Server.Category.ArtifactName     # TODO: Set name (e.g., Server.Utils.CollectInfo)
+description: |
+  TODO: One-line summary of what this server artifact does.
+
+  Explain:
+  - What server-side operation this performs
+  - What inputs it requires (parameters, server metadata)
+  - What output or side effects it produces
+  - When to use it vs alternatives
+
+  ## NOTES
+  - Note any important requirements (credentials, permissions, dependencies).
+
+type: SERVER                            # SERVER (one-time) or SERVER_EVENT (continuous)
+                                        # Never omit the type field on server artifacts.
+
+author: TODO Author Name - @handle      # TODO: Set your name and handle
+
+# Server artifacts generally have NO precondition.
+# If credentials are required, check them in the query body instead.
+# See the credential check pattern below.
+
+parameters:
+  # -- Target client (for single-client operations) --
+  - name: ClientId
+    default: "C.1234"
+    description: The client ID to operate on.
+    # TODO: Remove if not targeting a specific client
+
+  # -- Optional credential parameter (with server_metadata fallback) --
+  # - name: ApiKey
+  #   type: redacted
+  #   description: API key. Leave blank to use server metadata (ApiKey).
+
+  # -- Safety confirmation for destructive operations --
+  # - name: ReallyDoIt
+  #   type: bool
+  #   description: Set to actually perform the operation (dry run by default).
+
+  # -- Regex filter for artifact selection --
+  # - name: ArtifactNameRegex
+  #   type: regex
+  #   default: "."
+  #   description: Only process artifacts matching this regex.
+
+# Uncomment for operations requiring admin privileges:
+# required_permissions:
+#   - SERVER_ADMIN   # Import artifacts, modify server config
+
+# Uncomment for operations that delete data:
+# required_permissions:
+#   - MACHINE_STATE  # Delete flows or events
+
+# Allow low-privileged users to run this artifact (controlled delegation):
+# impersonate:
+#   admin
+
+sources:
+  - query: |
+      -- Step 1: Load credentials from parameter or server_metadata() fallback
+      -- Always materialize credentials with <= to avoid repeated lookups
+      -- LET api_key <= if(condition=ApiKey,
+      --   then=ApiKey,
+      --   else=server_metadata().ApiKey)
+
+      -- Step 2: Validate required credentials before proceeding
+      -- LET validated = if(condition=api_key,
+      --   then=api_key,
+      --   else=log(message="ApiKey not configured in server metadata") AND FALSE)
+
+      -- Step 3: Main server-side operation
+      -- TODO: Replace with your actual logic
+
+      -- Example: Query clients and enrich with info
+      SELECT client_id,
+             os_info.fqdn AS Hostname,
+             os_info.system AS OS,
+             timestamp(epoch=last_seen_at / 1000000) AS LastSeen
+      FROM clients()
+      WHERE os_info.fqdn =~ "."
+
+      -- -----------------------------------------------------------------------
+      -- SERVER_EVENT pattern: Uncomment and replace SELECT above for continuous
+      -- monitoring. SERVER_EVENT queries must NEVER terminate.
+      -- -----------------------------------------------------------------------
+      -- SELECT ClientId, FlowId,
+      --        timestamp(epoch=Timestamp) AS CompletionTime,
+      --        Flow.artifacts_with_results AS Artifacts
+      -- FROM watch_monitoring(artifact='System.Flow.Completion')
+      -- WHERE Flow.artifacts_with_results =~ ArtifactNameRegex
+
+      -- -----------------------------------------------------------------------
+      -- Scheduled task pattern: Uncomment for clock-based periodic execution.
+      -- -----------------------------------------------------------------------
+      -- SELECT * FROM foreach(
+      --   row={SELECT * FROM clock(period=3600)},
+      --   query={
+      --     SELECT * FROM do_something()
+      --   })
+
+# Uncomment for reports section (notebook visualization):
+# reports:
+#   - type: SERVER
+#     timeout: 10
+#     template: |
+#       {{ define "ReportQuery" }}
+#         SELECT * FROM source()
+#       {{ end }}

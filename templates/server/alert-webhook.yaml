@@ -1,0 +1,187 @@
+# Template: Server Alert Webhook Integration
+# Platform: server
+# Use when: Forwarding alerts to external platforms (Slack, Teams, Discord, TheHive, email)
+
+# =============================================================================
+# Based on: Server.Alerts.Notification, Server.Alerts.TheHive.Alert
+#
+# Patterns demonstrated:
+#   - type: SERVER_EVENT for continuous alert forwarding
+#   - watch_monitoring('System.Flow.Completion') or 'Server.Internal.Alerts'
+#   - http_client(method="POST") with JSON body for webhooks
+#   - serialize(item=dict(), format="json") for JSON encoding
+#   - format() for message construction with args array
+#   - Credential fallback: if(condition=Param, then=Param, else=server_metadata().Key)
+#   - Bearer authentication for TheHive (Authorization header)
+#   - mail() for email alerts with debouncing via period parameter
+#   - Multi-step TheHive workflow: create case → add observable
+#
+# Platform notes:
+#   Slack/Teams/Discord: identical JSON format {"text": "message"}
+#   TheHive:             Bearer auth, /api/alert or /api/case endpoint
+#   Email:               mail() function (no http_client), period= debounces
+#
+# Credentials: Store in Server Metadata (Server Artifacts → Server Metadata)
+#   SlackToken: webhook URL
+#   TheHiveKey: API Bearer token
+# =============================================================================
+
+name: Server.Alerts.ArtifactName      # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what alerts are forwarded and to which platform.
+
+  Describe: which event stream triggers alerts, what data is included in the
+  message, and how credentials are configured.
+
+  ## Configuration
+
+  Store webhook credentials in Server Metadata (GUI: Server Artifacts → Server Metadata):
+  - SlackToken: Slack/Teams/Discord webhook URL
+  - TheHiveKey: TheHive API Bearer token
+
+type: SERVER_EVENT                     # Required for continuous alert forwarding
+author: TODO Author Name - @handle
+
+parameters:
+  - name: SlackToken
+    description: Slack/Teams/Discord webhook URL. Leave blank to use server_metadata().SlackToken.
+
+  - name: TheHiveURL
+    description: TheHive server URL.
+    default: https://mythehive
+
+  - name: TheHiveKey
+    description: TheHive API Bearer token. Leave blank to use server_metadata().TheHiveKey.
+
+  - name: VeloServerURL
+    description: Velociraptor server URL for clickable links in alert messages.
+    default: https://myvelo
+
+  - name: ArtifactNameRegex
+    description: Only alert on flows that collected these artifacts (regex).
+    type: regex
+    default: Windows.Detection.*
+    # TODO: Set to the artifacts you want to alert on
+
+  - name: HostnameFilter
+    description: Only alert on clients matching this hostname (regex).
+    type: regex
+    default: .
+
+  - name: DisableSSLVerify
+    type: bool
+    description: Disable SSL certificate verification for webhook requests.
+    default: N
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN 1: Slack/Teams/Discord webhook — identical JSON format
+      -- =====================================================================
+
+      -- Credential fallback: parameter takes precedence over server_metadata()
+      LET slack_url <= if(condition=SlackToken,
+          then=SlackToken,
+          else=server_metadata().SlackToken)
+
+      -- Watch for flow completions that match the artifact filter
+      LET flow_events = SELECT ClientId,
+             FlowId,
+             timestamp(epoch=Timestamp) AS CompletionTime,
+             Flow.artifacts_with_results AS Artifacts
+      FROM watch_monitoring(artifact='System.Flow.Completion')
+      WHERE Flow.artifacts_with_results =~ ArtifactNameRegex
+
+      -- Enrich with client info and send webhook notification
+      SELECT * FROM foreach(
+        row=flow_events,
+        query={
+          LET client <= client_info(client_id=ClientId)
+
+          LET message = format(
+            format="Alert: Flow completed on %v (%v)\nArtifacts: %v\nFlow: %v/app/index.html?#/collected/%v/%v\nTime: %v",
+            args=[client.os_info.fqdn, ClientId,
+                  join(array=Artifacts, sep=", "),
+                  VeloServerURL, ClientId, FlowId,
+                  CompletionTime])
+
+          -- POST to Slack/Teams/Discord webhook
+          SELECT * FROM http_client(
+            url=slack_url,
+            method="POST",
+            headers=dict(`Content-Type`="application/json"),
+            disable_ssl_security=DisableSSLVerify,
+            data=serialize(item=dict(text=message), format="json"))
+
+          FROM scope()
+          WHERE client.os_info.fqdn =~ HostnameFilter
+            AND slack_url   -- Only send if URL is configured
+        })
+
+      -- =====================================================================
+      -- PATTERN 2: Watch Server.Internal.Alerts instead of flow completions
+      -- Uncomment and replace the flow_events LET above:
+      -- =====================================================================
+      -- LET flow_events = SELECT *, name, event_data, artifact, client_id, timestamp
+      -- FROM watch_monitoring(artifact='Server.Internal.Alerts')
+      -- -- Fields: name (alert name), event_data (dict), artifact, client_id
+
+      -- =====================================================================
+      -- PATTERN 3: TheHive alert creation (Bearer auth)
+      -- Uncomment and add after Pattern 1 or replace it:
+      -- =====================================================================
+      -- LET thehive_key <= if(condition=TheHiveKey,
+      --     then=TheHiveKey,
+      --     else=server_metadata().TheHiveKey)
+      --
+      -- SELECT * FROM foreach(
+      --   row=flow_events,
+      --   query={
+      --     LET client <= client_info(client_id=ClientId)
+      --     SELECT * FROM http_client(
+      --       url=format(format="%v/api/alert", args=[TheHiveURL]),
+      --       method="POST",
+      --       headers=dict(
+      --         `Content-Type`="application/json",
+      --         `Authorization`=format(format="Bearer %v", args=[thehive_key])),
+      --       disable_ssl_security=DisableSSLVerify,
+      --       data=serialize(item=dict(
+      --         title=format(format="Hit on %v for %v",
+      --                      args=[Artifacts[0], client.os_info.fqdn]),
+      --         description=format(format="ClientId: %v\nFlowId: %v\nURL: %v/app/index.html?#/collected/%v/%v",
+      --                            args=[ClientId, FlowId, VeloServerURL, ClientId, FlowId]),
+      --         type="artifact-alert",
+      --         source="velociraptor",
+      --         sourceRef=format(format="%v", args=[rand(range=1000000000)]),
+      --         severity=2,   -- 1=Low 2=Medium 3=High 4=Critical
+      --         tlp=2),       -- 0=White 1=Green 2=Amber 3=Red
+      --         format="json"))
+      --     FROM scope()
+      --     WHERE client.os_info.fqdn =~ HostnameFilter AND thehive_key
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 4: Email notification with debouncing
+      -- Uncomment and replace Pattern 1 or add as additional action:
+      -- =====================================================================
+      -- - name: EmailAddress
+      --   description: Recipient email address.
+      --
+      -- SELECT * FROM foreach(
+      --   row=flow_events,
+      --   query={
+      --     LET client <= client_info(client_id=ClientId)
+      --     SELECT mail(
+      --       to=EmailAddress,
+      --       subject=format(format="Velociraptor Alert: %v", args=[client.os_info.fqdn]),
+      --       body=format(format="Flow %v completed on %v\nArtifacts: %v\nURL: %v/app/index.html?#/collected/%v/%v",
+      --                   args=[FlowId, client.os_info.fqdn, join(array=Artifacts, sep=", "),
+      --                         VeloServerURL, ClientId, FlowId]),
+      --       period=60) AS EmailSent   -- Debounce: max 1 email per 60 seconds
+      --     FROM scope()
+      --     WHERE client.os_info.fqdn =~ HostnameFilter
+      --   })
+
+column_types:
+  - name: CompletionTime
+    type: timestamp

@@ -1,0 +1,183 @@
+# Template: Linux Config File Parsing
+# Platform: linux
+# Use when: Parsing /etc/* config files (passwd, crontab, fstab, sysctl, key-value pairs)
+
+# =============================================================================
+# Based on: Linux.Sys.Crontab, Linux.Sys.Users, Linux.Sys.Groups
+#
+# Patterns demonstrated:
+#   A. split_records() with colon delimiter (/etc/passwd, /etc/group format)
+#   B. parse_string_with_regex() with multiple patterns (crontab format)
+#   C. split_records() with whitespace and comment filtering (/etc/fstab, /etc/hosts)
+#   D. Key-value pair parsing (sysctl.conf, /etc/environment format)
+#   E. Per-user config extraction from path (/var/spool/cron/crontabs/username)
+#
+# Common Linux config formats:
+#   Colon-delimited:   /etc/passwd (User:X:UID:GID:Comment:Home:Shell)
+#                      /etc/group  (Group:X:GID:Members)
+#   Whitespace:        /etc/fstab  (Device MountPoint FSType Options Dump Pass)
+#                      /etc/hosts  (IP Hostname Aliases)
+#   Key-value:         /etc/sysctl.conf  (key = value)
+#                      /etc/environment  (KEY=value)
+#   Crontab:           @event Command  OR  Min Hr DM Mon DW [User] Command
+# =============================================================================
+
+name: Linux.Config.ArtifactName        # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what config files this artifact parses.
+
+  Describe: which files are read, what format they use, and the forensic
+  or operational value of the extracted data.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'linux'
+
+parameters:
+  - name: ConfigFile
+    description: Primary config file path (for single-file patterns).
+    default: /etc/passwd
+
+  - name: ConfigGlob
+    description: Glob pattern for multiple config files.
+    default: /etc/crontab,/etc/cron.d/**,/var/spool/cron/**,/var/spool/cron/crontabs/**
+
+  - name: ScriptGlob
+    description: Glob pattern for script files referenced by configs.
+    default: /etc/cron.daily/*,/etc/cron.hourly/*,/etc/cron.weekly/*,/etc/cron.monthly/*
+
+  - name: Length
+    description: Maximum bytes to read from each script file.
+    type: int
+    default: 10000
+
+  - name: UploadFiles
+    type: bool
+    description: Upload raw config and script files for preservation.
+
+sources:
+  # ---------------------------------------------------------------------------
+  # PATTERN A: Colon-delimited files (/etc/passwd, /etc/group, /etc/shadow)
+  # split_records() with regex=":" splits each line into named columns.
+  # ---------------------------------------------------------------------------
+  - name: ColonDelimited
+    query: |
+      -- Parse /etc/passwd: User:X:UID:GID:Comment:Home:Shell
+      SELECT User, Uid, Gid, Description, Homedir, Shell
+      FROM split_records(
+        filenames=ConfigFile,
+        regex=":",
+        record_regex="\r?\n",
+        columns=["User", "X", "Uid", "Gid", "Description", "Homedir", "Shell"])
+      -- TODO: Adjust columns for your format:
+      --   /etc/group:  Group:X:GID:Members
+      --   /etc/shadow: User:Hash:LastChange:Min:Max:Warn:Inactive:Expire
+
+  # ---------------------------------------------------------------------------
+  # PATTERN B: Complex regex parsing — crontab format
+  # Multiple possible entry formats handled with an array of regex patterns.
+  # ---------------------------------------------------------------------------
+  - name: CrontabParsing
+    query: |
+      LET raw = SELECT * FROM foreach(
+        row={SELECT OSPath FROM glob(globs=split(string=ConfigGlob, sep=","))
+             WHERE NOT IsDir},
+        query={
+          SELECT OSPath,
+                 data,
+                 parse_string_with_regex(
+                   string=data,
+                   regex=[
+                     -- Pattern 1: Event-based (@reboot, @daily, etc.)
+                     "^(?P<Event>@[a-zA-Z]+)\\s+(?P<Command>.+)",
+                     -- Pattern 2: Standard crontab with User field (system crontab)
+                     "^(?P<Minute>[^\\s]+)\\s+(?P<Hour>[^\\s]+)\\s+" +
+                     "(?P<DayOfMonth>[^\\s]+)\\s+(?P<Month>[^\\s]+)\\s+" +
+                     "(?P<DayOfWeek>[^\\s]+)\\s+(?P<User>[^\\s]+)\\s+(?P<Command>.+)$",
+                     -- Pattern 3: User crontab (no User field)
+                     "^(?P<Minute>[^\\s]+)\\s+(?P<Hour>[^\\s]+)\\s+" +
+                     "(?P<DayOfMonth>[^\\s]+)\\s+(?P<Month>[^\\s]+)\\s+" +
+                     "(?P<DayOfWeek>[^\\s]+)\\s+(?P<Command>.+)$"
+                   ]) AS Record
+          FROM split_records(
+            filenames=OSPath,
+            regex="\n",
+            columns=["data"])
+          WHERE NOT data =~ "^\\s*#"   -- Skip comments
+            AND NOT data =~ "^\\s*$"   -- Skip empty lines
+        })
+      WHERE Record.Command  -- Only keep matched entries
+
+      SELECT Record.Event AS Event,
+             Record.User AS User,
+             Record.Minute AS Minute,
+             Record.Hour AS Hour,
+             Record.DayOfMonth AS DayOfMonth,
+             Record.Month AS Month,
+             Record.DayOfWeek AS DayOfWeek,
+             Record.Command AS Command,
+             OSPath AS ConfigPath,
+             -- Extract username from per-user crontab paths
+             parse_string_with_regex(
+               regex="/crontabs/(?P<Owner>[^/]+)$",
+               string=str(str=OSPath)).Owner AS Owner
+      FROM raw
+
+  # ---------------------------------------------------------------------------
+  # PATTERN C: Whitespace-delimited with comment filtering (/etc/fstab, /etc/hosts)
+  # ---------------------------------------------------------------------------
+  # - name: WhitespaceDelimited
+  #   query: |
+  #     SELECT * FROM split_records(
+  #       filenames=ConfigFile,
+  #       regex='\\s+',
+  #       columns=['Field1', 'Field2', 'Field3', 'Field4', 'Field5', 'Field6'])
+  #     WHERE NOT Field1 =~ "^#"   -- Skip comment lines
+  #       AND Field1               -- Skip empty lines
+  #     -- Example /etc/fstab: Device MountPoint FSType Options Dump Pass
+  #     -- Example /etc/hosts: IP Hostname [Aliases...]
+
+  # ---------------------------------------------------------------------------
+  # PATTERN D: Key-value pairs (/etc/sysctl.conf, /etc/environment)
+  # ---------------------------------------------------------------------------
+  # - name: KeyValuePairs
+  #   query: |
+  #     SELECT parse_string_with_regex(
+  #       string=data,
+  #       regex=[
+  #         '^(?P<Key>[^=:]+)=(?P<Value>.+)$',    -- key=value
+  #         '^(?P<Key>[^:]+):\\s*(?P<Value>.+)$'  -- key: value
+  #       ]) AS Parsed, OSPath
+  #     FROM split_records(
+  #       filenames=ConfigFile, regex='\n', columns=['data'])
+  #     WHERE NOT data =~ '^\s*#'   -- Skip comments
+  #       AND data =~ '[=:]'        -- Must contain delimiter
+
+  # ---------------------------------------------------------------------------
+  # Script content extraction (files referenced by cron / configs)
+  # ---------------------------------------------------------------------------
+  - name: ScriptContent
+    query: |
+      SELECT Mtime,
+             OSPath,
+             read_file(filename=OSPath, length=Length) AS Content
+      FROM glob(globs=split(string=ScriptGlob, sep=","))
+      WHERE NOT IsDir
+
+  # ---------------------------------------------------------------------------
+  # Upload raw files when UploadFiles is set
+  # ---------------------------------------------------------------------------
+  - name: UploadedFiles
+    query: |
+      SELECT * FROM if(condition=UploadFiles,
+        then={
+          SELECT OSPath, Size, Mtime, upload(file=OSPath) AS Upload
+          FROM glob(globs=split(
+            string=ConfigGlob + "," + ScriptGlob,
+            sep=","))
+        })
+
+column_types:
+  - name: Upload
+    type: preview_upload

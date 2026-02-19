@@ -1,0 +1,201 @@
+# Template: Server Client Collection Workflow
+# Platform: server
+# Use when: Scheduling artifact collection on specific clients and retrieving results
+
+# =============================================================================
+# Based on: Server.Utils.CollectClient
+#
+# Patterns demonstrated:
+#   - type: SERVER for one-time execution
+#   - clients(search=) to find target clients by ID, hostname, or label
+#   - collect_client(client_id=, artifacts=, env=) to schedule collection
+#   - watch_monitoring('System.Flow.Completion') to wait for flow completion
+#   - source(client_id=, flow_id=, artifact=) to retrieve results
+#   - Multi-client collection with foreach(workers=)
+#   - Label-based targeting with label removal after collection
+#   - create_flow_download() for ZIP package creation
+#
+# Critical: RACE CONDITION
+#   Always materialize the collection (LET x <=) BEFORE starting watch_monitoring().
+#   If the flow completes before watch starts, the completion event is missed.
+#   Pattern: materialize collect_client → watch → retrieve
+#
+# Collection workflow:
+#   1. Find clients with clients(search=)
+#   2. Schedule with collect_client() — returns flow_id immediately
+#   3. Wait with watch_monitoring('System.Flow.Completion')
+#   4. Retrieve results with source()
+# =============================================================================
+
+name: Server.Utils.ArtifactName        # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what this artifact collects from clients.
+
+  Describe: which artifact is collected, how clients are selected, and
+  what the results are used for.
+
+type: SERVER                            # One-time execution
+author: TODO Author Name - @handle
+
+parameters:
+  - name: ClientSearch
+    description: |
+      Client ID, hostname, or search query.
+      Examples: "C.1234", "prod-web-01", "label:Suspicious", "prod-.*"
+    default: C.1234
+
+  - name: ArtifactName
+    description: Artifact to collect from the client.
+    default: Generic.Client.Info
+    # TODO: Set to the artifact you want to collect
+
+  - name: Parameters
+    description: JSON object with key/value parameters for the artifact.
+    type: json
+    default: "{}"
+    # Example: {"UserRegex": "admin.*"}
+
+  - name: MaxClients
+    description: Maximum number of clients to collect from.
+    type: int
+    default: "10"
+
+  - name: Workers
+    description: Number of parallel collection workers (for multi-client).
+    type: int
+    default: "5"
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN 1: Single client collection (default)
+      -- Find client → collect → wait → retrieve results
+      -- =====================================================================
+
+      -- Step 1: Find target client(s)
+      LET target_clients = SELECT client_id,
+             os_info.fqdn AS Hostname,
+             timestamp(epoch=last_seen_at / 1000000) AS LastSeen
+      FROM clients(search=ClientSearch)
+      LIMIT MaxClients
+
+      LET client_id <= target_clients[0].client_id
+
+      -- Step 2: Schedule collection (returns immediately with flow_id)
+      LET collection <= if(condition=client_id,
+          then=collect_client(
+            client_id=client_id,
+            artifacts=ArtifactName,
+            env=Parameters),
+          else=log(message="No client found: " + ClientSearch) AND FALSE)
+
+      -- Step 3: Wait for flow completion
+      -- IMPORTANT: Materialized collection must happen BEFORE watch starts
+      LET flow_completion <= SELECT * FROM if(condition=collection, then={
+        SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+        WHERE FlowId = collection.flow_id
+        LIMIT 1
+      })
+
+      -- Step 4: Retrieve results from all artifacts that produced data
+      SELECT * FROM foreach(
+        row=flow_completion[0].Flow.artifacts_with_results,
+        query={
+          SELECT *,
+                 _value AS SourceArtifact,
+                 client_id AS ClientId,
+                 collection.flow_id AS FlowId
+          FROM source(
+            client_id=client_id,
+            flow_id=collection.flow_id,
+            artifact=_value)
+          -- source= specifies named source within multi-source artifact
+        })
+
+      -- =====================================================================
+      -- PATTERN 2: Multi-client collection in parallel
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- LET multi_collections = SELECT *,
+      --        collect_client(client_id=client_id,
+      --                       artifacts=ArtifactName, env=Parameters) AS Collection
+      -- FROM target_clients
+      --
+      -- LET all_completions = SELECT * FROM foreach(
+      --   row=multi_collections,
+      --   workers=Workers,
+      --   query={
+      --     SELECT *, client_id, Collection
+      --     FROM watch_monitoring(artifact='System.Flow.Completion')
+      --     WHERE FlowId = Collection.flow_id
+      --     LIMIT 1
+      --   })
+      --
+      -- SELECT * FROM foreach(
+      --   row=all_completions,
+      --   query={
+      --     SELECT * FROM foreach(
+      --       row=Flow.artifacts_with_results,
+      --       query={
+      --         SELECT *, _value AS SourceArtifact, client_id, Collection.flow_id AS FlowId
+      --         FROM source(client_id=client_id, flow_id=Collection.flow_id, artifact=_value)
+      --       })
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 3: Label-based targeting (label-as-queue)
+      -- Find clients with label → collect → remove label → retrieve results
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- LET labeled_clients = SELECT client_id,
+      --        os_info.fqdn AS Hostname
+      -- FROM clients(search="label:" + LabelGroup)
+      -- LIMIT MaxClients
+      --
+      -- LET collections = SELECT *,
+      --        collect_client(client_id=client_id,
+      --                       artifacts=ArtifactName, env=Parameters) AS Collection,
+      --        label(client_id=client_id, labels=LabelGroup, op="remove") AS _Removed
+      -- FROM labeled_clients
+      --
+      -- LET completions = SELECT * FROM foreach(
+      --   row=collections, workers=Workers,
+      --   query={
+      --     SELECT *, client_id, Collection
+      --     FROM watch_monitoring(artifact='System.Flow.Completion')
+      --     WHERE FlowId = Collection.flow_id
+      --     LIMIT 1
+      --   })
+      --
+      -- SELECT * FROM foreach(
+      --   row=completions,
+      --   query={
+      --     SELECT * FROM foreach(
+      --       row=Flow.artifacts_with_results,
+      --       query={
+      --         SELECT *, _value AS SourceArtifact, client_id, Collection.flow_id AS FlowId
+      --         FROM source(client_id=client_id, flow_id=Collection.flow_id, artifact=_value)
+      --       })
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 4: Collect and create downloadable ZIP
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- LET completion <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+      --   WHERE FlowId = collection.flow_id LIMIT 1
+      --
+      -- LET download <= create_flow_download(
+      --   client_id=client_id,
+      --   flow_id=collection.flow_id,
+      --   wait=TRUE)
+      --
+      -- SELECT client_id, collection.flow_id AS FlowId,
+      --        download.vfs_path AS DownloadPath,
+      --        download.size AS DownloadSize
+      -- FROM scope()
+      -- WHERE completion
+
+column_types:
+  - name: LastSeen
+    type: timestamp

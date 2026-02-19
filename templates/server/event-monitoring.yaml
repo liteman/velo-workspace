@@ -1,0 +1,116 @@
+# Template: Server Event Monitoring
+# Platform: server
+# Use when: Monitoring server event streams (flow completions, alerts, enrollments, label changes)
+
+# =============================================================================
+# Based on: Server.Internal.Interrogate, Server.Monitor.Shell
+#
+# Patterns demonstrated:
+#   - type: SERVER_EVENT for continuous monitoring (query never terminates)
+#   - watch_monitoring(artifact='System.Flow.Completion') for flow events
+#   - Flow.artifacts_with_results filtering for specific artifacts
+#   - source(client_id=, flow_id=, artifact=) to retrieve flow results
+#   - client_info(client_id=) for hostname enrichment
+#   - Timestamp conversion: Flow.create_time / 1000000 (microseconds to epoch)
+#
+# Common event streams:
+#   System.Flow.Completion         — any flow completing with results
+#   Server.Internal.Alerts         — centralized alert queue
+#   Server.Internal.Enrollment     — new client enrollments
+#   Server.Internal.ClientConflict — duplicate client ID conflicts
+#   Server.Internal.HuntModification — hunt state changes
+#   Server.Internal.Label          — label add/remove events
+#
+# IMPORTANT: SERVER_EVENT artifacts run continuously — the query must never
+# terminate (no LIMIT on the outer query, no finite event source).
+# Timestamps from Flow object are in microseconds; divide by 1000000.
+# =============================================================================
+
+name: Server.Monitor.ArtifactName      # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what server events this artifact monitors.
+
+  Describe: which event stream is watched, what triggers action, and what
+  data is retrieved or logged.
+
+type: SERVER_EVENT                     # Required for continuous monitoring
+author: TODO Author Name - @handle
+
+parameters:
+  - name: ArtifactNameRegex
+    description: Monitor flows that collected these artifacts (regex).
+    type: regex
+    default: Windows.Detection.*
+    # TODO: Set to the artifact(s) you want to monitor
+
+  - name: HostnameFilter
+    description: Only process events from clients matching this hostname (regex).
+    type: regex
+    default: .
+
+  - name: IncludeFlowDetails
+    type: bool
+    description: Include flow metadata (creator, state, row counts) in output.
+
+sources:
+  - query: |
+      -- Watch for flow completions matching the artifact filter
+      LET flow_completions = SELECT ClientId,
+             FlowId,
+             Flow,
+             timestamp(epoch=Timestamp) AS CompletionTime,
+             Flow.artifacts_with_results AS ArtifactsWithResults
+      FROM watch_monitoring(artifact='System.Flow.Completion')
+      WHERE Flow.artifacts_with_results =~ ArtifactNameRegex
+
+      -- TODO: Uncomment to watch other event streams instead:
+      -- LET enrollment_events = SELECT *
+      -- FROM watch_monitoring(artifact='Server.Internal.Enrollment')
+      -- -- Fields: ClientId, EnrollmentTime, etc.
+
+      -- LET alert_events = SELECT *, name, event_data, artifact, client_id, timestamp
+      -- FROM watch_monitoring(artifact='Server.Internal.Alerts')
+
+      -- LET conflict_events = SELECT *
+      -- FROM watch_monitoring(artifact='Server.Internal.ClientConflict')
+      -- -- Auto-resolve with: collect_client(client_id=ClientId, artifacts='Generic.Client.Rekey')
+
+      -- Enrich each flow with client info and retrieve results
+      SELECT * FROM foreach(
+        row=flow_completions,
+        query={
+          LET client <= client_info(client_id=ClientId)
+
+          SELECT ClientId,
+                 FlowId,
+                 CompletionTime,
+                 client.os_info.fqdn AS Hostname,
+                 client.os_info.system AS OS,
+                 ArtifactsWithResults,
+
+                 if(condition=IncludeFlowDetails,
+                    then=dict(
+                      Creator=Flow.request.creator,
+                      State=Flow.state,
+                      TotalRows=Flow.total_collected_rows,
+                      TotalBytes=Flow.total_uploaded_bytes,
+                      CreateTime=timestamp(epoch=Flow.create_time / 1000000),
+                      ActiveTime=timestamp(epoch=Flow.active_time / 1000000)
+                    )) AS FlowDetails,
+
+                 -- Retrieve actual results from completed flow
+                 -- TODO: Customize to retrieve the specific source you need
+                 {
+                   SELECT * FROM source(
+                     client_id=ClientId,
+                     flow_id=FlowId,
+                     artifact=ArtifactsWithResults[0])
+                 } AS Results
+
+          FROM scope()
+          WHERE client.os_info.fqdn =~ HostnameFilter
+        })
+
+column_types:
+  - name: CompletionTime
+    type: timestamp

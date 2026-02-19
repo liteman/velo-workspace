@@ -1,0 +1,118 @@
+# Template: Linux /proc Filesystem Parsing
+# Platform: linux
+# Use when: Extracting kernel-provided runtime data from the /proc pseudo-filesystem
+
+# =============================================================================
+# Based on: Linux.Proc.Modules, Linux.Proc.Arp, Linux.Sys.CPUTime
+#
+# Patterns demonstrated:
+#   A. split_records() with explicit columns (whitespace-delimited /proc files)
+#   B. split_records() with first_row_is_headers=true (tabular /proc files)
+#   C. parse_records_with_regex() for complex multi-line record parsing
+#   D. Filtered rows with atoi() type conversion
+#
+# Common /proc file formats:
+#   - Space-delimited:  /proc/modules, /proc/stat       → Pattern A
+#   - Header + rows:   /proc/net/arp, /proc/net/tcp     → Pattern B
+#   - Complex records: /proc/cpuinfo, /proc/meminfo     → Pattern C
+#   - Per-process:     /proc/[pid]/cmdline, /proc/[pid]/maps → Pattern A/regex
+#
+# Key functions:
+#   split_records(filenames=, regex=, columns=, first_row_is_headers=)
+#   parse_records_with_regex(file=, regex=)
+#   parse_string_with_regex(string=, regex=[...])  — multi-pattern extraction
+#   atoi(string=)  — convert string field to integer
+# =============================================================================
+
+name: Linux.Proc.ArtifactName          # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what /proc data this artifact collects.
+
+  Describe: which /proc files are read, what kernel state they expose,
+  and the forensic or operational value of the extracted data.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'linux'
+
+parameters:
+  - name: ProcFile
+    description: Path to the primary /proc file to parse.
+    default: /proc/modules
+    # Common /proc files:
+    #   /proc/modules        — loaded kernel modules
+    #   /proc/net/arp        — ARP table
+    #   /proc/net/tcp        — TCP connections (hex encoded)
+    #   /proc/stat           — CPU and system stats
+    #   /proc/meminfo        — memory information
+    #   /proc/cpuinfo        — CPU information (multi-line records)
+    #   /proc/mounts         — mounted filesystems
+    #   /proc/sys/kernel/*   — kernel parameters
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: Whitespace-delimited /proc file with explicit columns
+      -- Use when /proc file has consistent space-separated fields, no header.
+      -- Example: /proc/modules (Name Size UseCount UsedBy Status Address)
+      -- =====================================================================
+      SELECT Name,
+             atoi(string=Size) AS Size,
+             atoi(string=UseCount) AS UseCount,
+             UsedBy,
+             Status,
+             Address
+      FROM split_records(
+        filenames=ProcFile,
+        regex='\\s+',                  -- split on one or more whitespace
+        columns=['Name', 'Size', 'UseCount', 'UsedBy', 'Status', 'Address'])
+      -- TODO: Adjust column names and count to match your /proc file
+      -- TODO: Add WHERE clause to filter specific entries
+
+      -- =====================================================================
+      -- PATTERN B: Header row with variable whitespace
+      -- Use when /proc file has a descriptive header followed by data rows.
+      -- Example: /proc/net/arp (IP HW_type Flags HW_address Mask Device)
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT * FROM split_records(
+      --   filenames=ProcFile,
+      --   regex='\\s{2,20}',          -- 2-20 spaces between columns
+      --   first_row_is_headers=true)
+      -- Column names will be taken from the first row automatically
+      -- TODO: Add WHERE / SELECT to filter and rename columns
+
+      -- =====================================================================
+      -- PATTERN C: Complex multi-line records (e.g., /proc/cpuinfo)
+      -- Use when records span multiple lines and need field-by-field extraction.
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- LET records = SELECT parse_string_with_regex(
+      --   string=Record,
+      --   regex=[
+      --     'Field1:\\s+(?P<Field1>.+)',
+      --     'Field2:\\s+(?P<Field2>.+)',
+      --     'Field3:\\s+(?P<Field3>[0-9]+)'
+      --   ]) AS Record
+      -- FROM parse_records_with_regex(
+      --   file=ProcFile,
+      --   regex='(?sm)^(?P<Record>Field1:.+?)\\n\\n')  -- blank-line delimiter
+      --
+      -- SELECT Record.Field1 AS Field1,
+      --        Record.Field2 AS Field2,
+      --        atoi(string=Record.Field3) AS Field3
+      -- FROM records
+      -- WHERE Record.Field1   -- Filter out unmatched records
+      -- TODO: Customize field names and regex for your format
+
+      -- =====================================================================
+      -- PATTERN D: Regex parsing with parse_records_with_regex() (e.g., /proc/mounts)
+      -- Use for space-separated files where named groups are cleaner.
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT Device, Mount, FSType, split(string=Opts, sep=",") AS Options
+      -- FROM parse_records_with_regex(
+      --   file=ProcFile,
+      --   regex='(?m)^(?P<Device>[^ ]+) (?P<Mount>[^ ]+) (?P<FSType>[^ ]+) (?P<Opts>[^ ]+)')
+      -- TODO: Adjust regex groups for your file format

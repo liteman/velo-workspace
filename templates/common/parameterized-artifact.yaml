@@ -1,0 +1,252 @@
+# Template: Parameterized Artifact (All Parameter Types)
+# Platform: common
+# Use when: You need a reference for all available parameter types and their VQL consumption patterns
+
+# =============================================================================
+# This template demonstrates every parameter type available in Velociraptor.
+# It is a reference artifact, not a production template.
+#
+# Use this when:
+#   - You need to know how to declare a specific parameter type
+#   - You want to see how each type is consumed in VQL
+#   - You are building a new artifact and choosing parameter types
+#
+# See core.md Section 3 for the full parameter type reference.
+# =============================================================================
+
+name: Generic.Reference.AllParameterTypes
+description: |
+  Reference artifact demonstrating all Velociraptor parameter types.
+
+  This artifact does not collect meaningful data. It is a reference for
+  parameter declaration syntax and VQL consumption patterns.
+
+type: CLIENT
+
+author: Reference Template
+
+precondition: |
+  SELECT OS FROM info() WHERE OS =~ 'linux'
+
+parameters:
+  # -------------------------------------------------------------------------
+  # string (default type)
+  # Used for: file paths, glob patterns, SQL queries, URLs, registry keys
+  # VQL: Reference by name directly
+  # -------------------------------------------------------------------------
+  - name: StringParam
+    default: /etc/passwd
+    description: A string parameter for paths, queries, or other text.
+
+  # -------------------------------------------------------------------------
+  # bool — Y/N toggle
+  # IMPORTANT: Default must be Y or N, never true/false
+  # VQL: if(condition=BoolParam, then=..., else=...)
+  # -------------------------------------------------------------------------
+  - name: BoolParam
+    type: bool
+    default: N
+    description: A boolean toggle. Default N = false, Y = true.
+
+  # -------------------------------------------------------------------------
+  # regex — regular expression for filtering
+  # Convention: Default "." matches everything (optional filter)
+  # VQL: WHERE SomeField =~ RegexParam
+  # -------------------------------------------------------------------------
+  - name: RegexParam
+    type: regex
+    default: .
+    description: Regex filter. Default '.' matches everything.
+
+  # -------------------------------------------------------------------------
+  # timestamp — ISO 8601 date/time filter
+  # Convention: Empty default "" means "no filter"
+  # VQL: Use with sentinel values for optional date range filtering
+  # -------------------------------------------------------------------------
+  - name: DateAfter
+    type: timestamp
+    description: "Only return results after this date. YYYY-MM-DDTmm:hh:ssZ"
+
+  - name: DateBefore
+    type: timestamp
+    description: "Only return results before this date. YYYY-MM-DDTmm:hh:ssZ"
+
+  # -------------------------------------------------------------------------
+  # int — integer value
+  # Also valid: integer, int64 (for large values like file sizes)
+  # VQL: Direct arithmetic use
+  # -------------------------------------------------------------------------
+  - name: IntParam
+    type: int
+    default: 60
+    description: An integer value (e.g., timeout in seconds, count limit).
+
+  - name: SizeMax
+    type: int64
+    default: 4294967296
+    description: Maximum file size in bytes (int64 for large values).
+
+  # -------------------------------------------------------------------------
+  # csv — table of values with header row
+  # Format: pipe-delimited with column names on first row
+  # VQL: Access columns by name: CsvParam.ColumnName
+  # -------------------------------------------------------------------------
+  - name: GlobTable
+    type: csv
+    default: |
+      Glob
+      /home/**
+      /tmp/**
+    description: CSV table of glob patterns. Access with GlobTable.Glob.
+
+  - name: MultiColumnTable
+    type: csv
+    default: |
+      Name,Enabled,Value
+      item_one,Y,100
+      item_two,N,200
+    description: Multi-column CSV table. Access with MultiColumnTable.Name, etc.
+
+  # -------------------------------------------------------------------------
+  # yara — YARA rule text
+  # VQL: FROM yara(files=OSPath, key="A", rules=YaraParam)
+  # -------------------------------------------------------------------------
+  - name: YaraRule
+    type: yara
+    default:
+    description: YARA rule for content matching. Leave empty to skip.
+
+  # -------------------------------------------------------------------------
+  # choices — dropdown selection from a fixed list
+  # VQL: Direct reference by name (value is the selected string)
+  # -------------------------------------------------------------------------
+  - name: AccessorChoice
+    type: choices
+    default: file
+    choices:
+      - auto
+      - file
+      - zip
+    description: Select from a fixed list of options.
+
+  # -------------------------------------------------------------------------
+  # glob — typed as a glob pattern (single string)
+  # VQL: FROM glob(globs=GlobParam)
+  # -------------------------------------------------------------------------
+  - name: GlobParam
+    type: glob
+    default: /{run,var}/log/journal/*/*.journal
+    description: A single glob pattern (not comma-separated).
+
+  # -------------------------------------------------------------------------
+  # hidden — hidden from the UI
+  # Used for: internal configuration, paths set by server-side tools
+  # VQL: Same as string; just not visible to the operator
+  # -------------------------------------------------------------------------
+  - name: HiddenConfig
+    type: hidden
+    default: /usr/local/bin
+    description: Hidden from UI. Used for internal configuration.
+
+  # -------------------------------------------------------------------------
+  # redacted — masked in the UI (for credentials)
+  # VQL: Same as string
+  # -------------------------------------------------------------------------
+  - name: ApiKey
+    type: redacted
+    description: Masked credential field. Value is not shown in the UI.
+
+  # -------------------------------------------------------------------------
+  # upload — operator can upload a file when launching the artifact
+  # VQL: Value becomes the uploaded file content/path
+  # -------------------------------------------------------------------------
+  - name: RuleFile
+    type: upload
+    description: Upload a file (e.g., YARA rules, IOC list).
+
+  # -------------------------------------------------------------------------
+  # json — structured JSON object
+  # VQL: parse_json(data=JsonParam) or direct field access
+  # -------------------------------------------------------------------------
+  - name: JsonParam
+    type: json
+    default: "{}"
+    description: JSON object parameter.
+
+  # -------------------------------------------------------------------------
+  # json_array — JSON array
+  # VQL: FROM parse_json_array(data=JsonArrayParam) or direct iteration
+  # -------------------------------------------------------------------------
+  - name: JsonArrayParam
+    type: json_array
+    default: "[]"
+    description: JSON array parameter.
+
+  # -------------------------------------------------------------------------
+  # yaml — YAML content
+  # VQL: Use as configuration data
+  # -------------------------------------------------------------------------
+  - name: YamlConfig
+    type: yaml
+    description: YAML configuration parameter.
+
+  # -------------------------------------------------------------------------
+  # artifactset — select artifacts with their parameters
+  # Used by: server artifacts that launch collections
+  # -------------------------------------------------------------------------
+  # - name: ArtifactList
+  #   type: artifactset
+  #   artifact_type: CLIENT
+  #   default: |
+  #     Artifact
+  #     Generic.Client.Info
+
+sources:
+  - query: |
+      -- Demonstrate VQL consumption patterns for each parameter type
+
+      -- string: use directly
+      LET str_result = SELECT OSPath FROM glob(globs=StringParam)
+
+      -- bool: use with if()
+      LET bool_result = if(condition=BoolParam, then="true", else="false")
+
+      -- regex: use with =~ operator
+      LET regex_result = SELECT * FROM str_result WHERE OSPath =~ RegexParam
+
+      -- timestamp: use sentinel values for optional date range
+      LET DateAfterTime <= if(condition=DateAfter,
+        then=DateAfter, else=timestamp(epoch="1600-01-01"))
+      LET DateBeforeTime <= if(condition=DateBefore,
+        then=DateBefore, else=timestamp(epoch="2200-01-01"))
+
+      -- int: use in arithmetic
+      LET int_result = IntParam * 2
+
+      -- csv: access column by header name
+      LET csv_result = SELECT * FROM glob(globs=GlobTable.Glob)
+
+      -- yara: pass to yara() plugin
+      -- FROM yara(files=OSPath, key="A", rules=YaraRule, accessor="file")
+
+      -- choices: use directly as a string value
+      LET accessor_val = AccessorChoice
+
+      -- glob: pass directly to glob()
+      LET glob_result = SELECT * FROM glob(globs=GlobParam)
+
+      -- json: parse with parse_json()
+      LET json_result = parse_json(data=JsonParam)
+
+      -- json_array: iterate with parse_json_array()
+      -- FROM parse_json_array(data=JsonArrayParam)
+
+      -- Final output demonstrating parameter consumption
+      SELECT
+        StringParam AS StringValue,
+        bool_result AS BoolValue,
+        IntParam AS IntValue,
+        AccessorChoice AS SelectedAccessor,
+        GlobTable.Glob AS GlobList,
+        now() AS CollectionTime
+      FROM scope()

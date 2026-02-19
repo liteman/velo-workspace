@@ -1,0 +1,66 @@
+# Template: Windows WMI/CIM Query
+# Platform: windows
+# Use when: Querying system state via WMI, or subscribing to WMI events for real-time monitoring
+
+# =============================================================================
+# Based on: Windows.Network.ArpCache, Windows.System.DiskInfo,
+#           Windows.System.Services
+#
+# Patterns demonstrated:
+#   A. Static WMI query (one-time data collection)
+#   B. WMI event subscription (CLIENT_EVENT for real-time monitoring)
+#   C. Namespace enumeration
+# =============================================================================
+
+name: Windows.Category.ArtifactName    # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what WMI data this artifact queries.
+
+  Describe: which WMI class is queried, what fields are returned,
+  and the forensic or operational value.
+
+type: CLIENT                            # Use CLIENT_EVENT for WMI event subscriptions
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'windows'
+
+parameters:
+  - name: WMIQuery
+    description: WMI query to execute.
+    default: SELECT * FROM Win32_Process    # TODO: Set your WMI query
+
+  - name: Namespace
+    description: WMI namespace to query.
+    default: ROOT/CIMV2
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: Static WMI query (CLIENT artifact)
+      -- =====================================================================
+      SELECT Name, ProcessId, CommandLine, ExecutablePath,
+             ParentProcessId, CreationDate
+      FROM wmi(query=WMIQuery, namespace=Namespace)
+      -- TODO: Replace column names with those from your WMI class
+
+      -- =====================================================================
+      -- PATTERN B: WMI event subscription (CLIENT_EVENT artifact)
+      -- Change type: to CLIENT_EVENT above. Query never terminates.
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT Parse.TargetInstance.Name AS ServiceName,
+      --        Parse.TargetInstance.PathName AS PathName,
+      --        Parse.TargetInstance.State AS State,
+      --        now() AS EventTime
+      -- FROM wmi_events(
+      --   query="SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Service'",
+      --   namespace="ROOT/CIMV2",
+      --   wait=60)
+      -- -- TODO: Adjust the WMI event class and WITHIN interval
+
+      -- =====================================================================
+      -- PATTERN C: Namespace enumeration
+      -- Use for discovery; uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT 'root/' + Name AS Namespace
+      -- FROM wmi(namespace='ROOT', query='SELECT * FROM __namespace')

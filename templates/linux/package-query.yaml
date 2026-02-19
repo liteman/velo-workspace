@@ -1,0 +1,202 @@
+# Template: Linux Package Manager Queries
+# Platform: linux
+# Use when: Querying installed packages across Linux distributions (dpkg, snap, dnf/yum, zypper, flatpak)
+
+# =============================================================================
+# Based on: Linux.Debian.Packages, Linux.RHEL.Packages, Linux.SuSE.Packages
+#
+# Patterns demonstrated:
+#   A. parse_records_with_regex() for dpkg /var/lib/dpkg/status file
+#   B. http_client() with UNIX socket URL for snap API
+#   C. execve() with switch() for dnf/yum fallback
+#   D. parse_xml() for zypper --xmlout output
+#   E. chain() to combine all package sources
+#
+# Distribution coverage:
+#   Debian/Ubuntu:  Parse /var/lib/dpkg/status (no command needed)
+#   Snap:           HTTP API via /run/snapd.socket UNIX socket
+#   RHEL/Fedora:    execve("dnf" or "yum") with fallback
+#   SUSE:           execve("zypper --xmlout search --installed-only")
+#   Flatpak:        execve("flatpak list")
+# =============================================================================
+
+name: Linux.Packages.ArtifactName     # TODO: Set artifact name
+description: |
+  TODO: One-line summary of which package types this artifact queries.
+
+  Describe: which package managers are included, what metadata is extracted,
+  and which Linux distributions are supported.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'linux'
+
+implied_permissions:
+  - EXECVE    # Required for running package manager commands
+
+parameters:
+  - name: DpkgStatusFile
+    description: Path to dpkg status file (Debian/Ubuntu).
+    default: /var/lib/dpkg/status
+
+  - name: SnapdSocket
+    description: Path to snapd UNIX socket.
+    default: /run/snapd.socket
+
+  - name: HumanizeSize
+    type: bool
+    description: Display package sizes in human-readable format (KB, MB, GB).
+    default: Y
+
+sources:
+  # ---------------------------------------------------------------------------
+  # PATTERN A: Debian/Ubuntu packages — parse dpkg status file
+  # No external command needed — parse /var/lib/dpkg/status directly.
+  # ---------------------------------------------------------------------------
+  - name: DebianPackages
+    query: |
+      -- Split file into multi-line records (each record starts with "Package:")
+      -- Then extract fields with multiple regex patterns in one pass
+      LET packages = SELECT parse_string_with_regex(
+        string=Record,
+        regex=[
+          'Package:\\s+(?P<Package>.+)',
+          'Installed-Size:\\s+(?P<InstalledSize>.+)',
+          'Version:\\s+(?P<Version>.+)',
+          'Architecture:\\s+(?P<Architecture>.+)',
+          'Section:\\s+(?P<Section>.+)',
+          'Source:\\s+(?P<Source>.+)',
+          'Maintainer:\\s+(?P<Maintainer>.+)',
+          '''Description:\\s+(?P<Description>.+(\n\\s+.+)*)'''
+        ]) AS Record
+      FROM parse_records_with_regex(
+        file=DpkgStatusFile,
+        regex='(?sm)^(?P<Record>Package:.+?)\\n\\n')
+
+      SELECT Record.Package AS Package,
+             if(condition=HumanizeSize,
+                then=humanize(bytes=atoi(string=Record.InstalledSize) * 1024),
+                else=atoi(string=Record.InstalledSize)) AS InstalledSize,
+             Record.Version AS Version,
+             Record.Architecture AS Architecture,
+             Record.Section AS Section,
+             Record.Source AS Source,
+             regex_replace(source=Record.Description,
+                           re='''^\s+\.$''') AS _Description
+      FROM packages
+      WHERE Record.Package
+
+  # ---------------------------------------------------------------------------
+  # PATTERN B: Snap packages — UNIX socket HTTP API
+  # Queries snapd via http_client() with a UNIX socket URL.
+  # ---------------------------------------------------------------------------
+  - name: SnapPackages
+    query: |
+      -- Query snapd API: URL is SocketPath:unix/path
+      LET SnapData = SELECT parse_json(data=Content).result AS Result
+        FROM http_client(url=SnapdSocket + ':unix/v2/snaps')
+        WHERE Response = 200
+          OR NOT log(message="Snap query failed: %v", args=Content)
+
+      SELECT * FROM foreach(
+        row=SnapData,
+        query={
+          SELECT name AS Name,
+                 'snap' AS PackageType,
+                 version AS Version,
+                 channel AS Channel,
+                 publisher.`display-name` AS Publisher,
+                 if(condition=HumanizeSize,
+                    then=humanize(bytes=`installed-size`),
+                    else=`installed-size`) AS InstalledSize,
+                 timestamp(string=`install-date`) AS InstalledAt,
+                 summary AS _Summary
+          FROM foreach(row=Result)
+        })
+
+  # ---------------------------------------------------------------------------
+  # PATTERN C: RHEL/Fedora packages — execve() with switch() fallback
+  # Try dnf first, fall back to yum if dnf not available.
+  # ---------------------------------------------------------------------------
+  - name: RHELPackages
+    query: |
+      LET Data <= SELECT * FROM switch(
+        dnf={
+          SELECT Stdout FROM execve(
+            argv=["dnf", "--quiet", "list", "installed"],
+            length=10000000)
+          WHERE Stdout
+        },
+        yum={
+          SELECT Stdout FROM execve(
+            argv=["yum", "--quiet", "list", "installed"],
+            length=10000000)
+          WHERE Stdout
+        },
+        none={
+          SELECT "" AS Stdout FROM scope()
+          WHERE log(level="ERROR", message="dnf/yum not found — skipping RHEL packages")
+        })
+
+      -- Normalize: dnf/yum sometimes wraps long lines
+      LET Normalized <= regex_replace(
+        source=Data[0].Stdout, re='(?sm)\n\s', replace="")
+
+      LET Parsed = SELECT parse_string_with_regex(
+        string=Line,
+        regex='([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)') AS Parsed
+      FROM parse_lines(accessor="data", filename=Normalized)
+
+      SELECT Parsed.g1 AS Package,
+             Parsed.g2 AS Version,
+             Parsed.g3 AS Repository
+      FROM Parsed
+      WHERE Repository =~ "^@"   -- Installed packages start with @
+
+  # ---------------------------------------------------------------------------
+  # PATTERN D: SUSE packages — zypper XML output
+  # XML output provides structured data without screen-scraping.
+  # ---------------------------------------------------------------------------
+  - name: SUSEPackages
+    query: |
+      LET zypper_out = SELECT * FROM execve(
+        length=10000000,
+        argv=["zypper", "--xmlout", "search", "--installed-only", "--details",
+              "--type=package"])
+
+      LET xml = parse_xml(file=str(str=zypper_out.Stdout), accessor="data")
+
+      SELECT * FROM foreach(
+        row=xml.stream.`search-result`.`solvable-list`.solvable,
+        query={
+          SELECT Attrname AS Package,
+                 Attredition AS Version,
+                 Attrarch AS Architecture,
+                 Attrrepository AS Repository
+          FROM _value
+        })
+
+  # ---------------------------------------------------------------------------
+  # PATTERN E: Flatpak packages — execve flatpak list
+  # ---------------------------------------------------------------------------
+  - name: FlatpakPackages
+    query: |
+      LET flatpak_out = SELECT * FROM execve(
+        argv=["flatpak", "list", "--app",
+              "--columns=name,version,size,installation"],
+        length=10000000)
+      WHERE Stdout
+        OR log(message="Flatpak not available or no packages installed")
+
+      SELECT * FROM split_records(
+        accessor="data",
+        filenames=flatpak_out.Stdout,
+        regex='\t',
+        first_row_is_headers=false,
+        columns=['Name', 'Version', 'Size', 'Installation'])
+      WHERE Name
+
+column_types:
+  - name: InstalledAt
+    type: timestamp

@@ -1,0 +1,171 @@
+# Template: Linux Network Connection Enumeration
+# Platform: linux
+# Use when: Listing active network connections with process enrichment, or parsing /proc/net/tcp
+
+# =============================================================================
+# Based on: Linux.Network.NetstatEnriched, Linux.Network.Netstat
+#
+# Patterns demonstrated:
+#   A. connections() with process_tracker enrichment
+#      - process_tracker_get(id=Pid).Data for process metadata
+#      - process_tracker_callchain(id=Pid).Data.Name for ancestry chain
+#      - process_tracker_tree(id=Pid) for child process tree (rendered as tree)
+#   B. Manual /proc/net/tcp parsing (hex-encoded IP/port, inode correlation)
+#      - GetPort() helper: extract port from hex "addr:port" field
+#      - ParseIP4() helper: reverse byte order from hex to dotted decimal
+#      - AllSockets: /proc/*/fd/* symlink → inode → process mapping
+#
+# Filtering:
+#   - ConnectionStatusRegex: "LISTEN|ESTAB" (common states)
+#   - IPRegex: filter by local or remote IP
+#   - PortRegex: filter by local or remote port
+#   - ProcessNameRegex, UsernameRegex, ProcessPathRegex, CommandLineRegex
+#   - CallChainRegex: "systemd -> sshd -> bash" ancestry matching
+# =============================================================================
+
+name: Linux.Network.ArtifactName       # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what network connections this artifact enumerates.
+
+  Describe: what filtering is applied (IPs, ports, states, process names),
+  what enrichment is included (call chains, process trees), and the use case.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS From info() where OS =~ 'linux'
+
+parameters:
+  - name: ConnectionStatusRegex
+    description: Filter by TCP connection status.
+    type: regex
+    default: "LISTEN|ESTAB"
+    # Common states: LISTEN, ESTAB, TIME_WAIT, CLOSE_WAIT, SYN_SENT
+
+  - name: IPRegex
+    description: Filter by IP address (local or remote).
+    type: regex
+    default: "."
+
+  - name: PortRegex
+    description: Filter by port number (local or remote).
+    type: regex
+    default: "."
+
+  - name: ProcessNameRegex
+    description: Filter by process name.
+    type: regex
+    default: "."
+
+  - name: UsernameRegex
+    description: Filter by process owner username.
+    type: regex
+    default: "."
+
+  - name: ProcessPathRegex
+    description: Filter by process executable path.
+    type: regex
+    default: "."
+
+  - name: CommandLineRegex
+    description: Filter by process command line.
+    type: regex
+    default: "."
+
+  - name: CallChainRegex
+    description: Filter by process ancestry (e.g., "systemd -> sshd -> bash").
+    type: regex
+    default: "."
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: connections() with process_tracker enrichment
+      -- connections() provides kernel network state; process_tracker_*()
+      -- adds process metadata and parent-child relationships.
+      -- =====================================================================
+      SELECT Laddr.IP AS Laddr,
+             Laddr.Port AS Lport,
+             Raddr.IP AS Raddr,
+             Raddr.Port AS Rport,
+             Pid,
+             Status,
+             -- Dict with Name, Exe, CommandLine, Username, Ppid, CreateTime, etc.
+             process_tracker_get(id=Pid).Data AS ProcInfo,
+             -- Array of ancestor names joined as "parent -> child" chain
+             join(array=process_tracker_callchain(id=Pid).Data.Name,
+                  sep=" -> ") AS CallChain,
+             -- Nested dict of child processes (rendered as expandable tree)
+             process_tracker_tree(id=Pid) AS ChildrenTree
+      FROM connections()
+      WHERE Status =~ ConnectionStatusRegex
+        AND Raddr =~ IPRegex
+        AND (Lport =~ PortRegex OR Rport =~ PortRegex)
+        AND ProcInfo.Name =~ ProcessNameRegex
+        AND ProcInfo.Username =~ UsernameRegex
+        AND ProcInfo.Exe =~ ProcessPathRegex
+        AND ProcInfo.CommandLine =~ CommandLineRegex
+        AND CallChain =~ CallChainRegex
+      -- TODO: Add specific threat hunting filters:
+      --   WHERE ProcInfo.Exe =~ "^/(tmp|var/tmp)/"   -- connections from /tmp
+      --   WHERE ProcInfo.Exe =~ "\\(deleted\\)$"      -- deleted executables
+      --   WHERE Status = "LISTEN" AND Lport = "4444"  -- suspicious listener
+
+      -- =====================================================================
+      -- PATTERN B: Manual /proc/net/tcp parsing
+      -- Lower-level approach for custom analysis or when connections() is unavailable.
+      -- Parses hex-encoded IP:port pairs and correlates inodes with processes.
+      -- Uncomment to replace Pattern A.
+      -- =====================================================================
+      -- Helper functions for hex parsing
+      -- LET GetPort(X) = int(int="0x" + regex_replace(source=X, re=".+:", replace=""))
+      --
+      -- LET _ParseIP4(X) = SELECT int(int="0x" + _value) AS I, _key
+      --   FROM items(item=split(sep=":",
+      --                         string=regex_replace(source=X, re="(..)", replace="$1:")))
+      --   WHERE _key < 4
+      --   ORDER BY _key DESC
+      --
+      -- LET ParseIP4(addr) = ip(parse=join(array=_ParseIP4(X=addr).I, sep="."))
+      --
+      -- -- TCP state names
+      -- LET StateLookup <= dict(`01`="Established", `02`="Syn Sent",
+      --                         `03`="Syn Recv",    `06`="Time Wait",
+      --                         `0A`="Listening",   `0B`="Closing")
+      --
+      -- -- Map socket inodes to processes via /proc/*/fd/*
+      -- LET X = SELECT OSPath[1] AS Pid, Data.Link AS Filename,
+      --     parse_string_with_regex(
+      --       string=Data.Link,
+      --       regex="(?P<Type>socket|pipe):\\[(?P<inode>[0-9]+)\\]") AS Details
+      --   FROM glob(globs="/proc/*/fd/*")
+      --
+      -- LET AllSockets <= SELECT atoi(string=Pid) AS Pid,
+      --     read_file(filename="/proc/" + Pid + "/comm") AS Command,
+      --     Details.inode AS Inode
+      --   FROM X
+      --   WHERE Details.Type =~ "socket"
+      --
+      -- LET GetProcByInode(inode) = SELECT * FROM AllSockets
+      --   WHERE Inode = inode LIMIT 1
+      --
+      -- SELECT inode,
+      --        get(item=StateLookup, field=st) AS State,
+      --        uid,
+      --        GetProcByInode(inode=inode)[0] AS ProcessInfo,
+      --        ParseIP4(addr=local_address) AS LocalAddr,
+      --        GetPort(X=local_address) AS LocalPort,
+      --        ParseIP4(addr=rem_address) AS RemoteAddr,
+      --        GetPort(X=rem_address) AS RemotePort
+      -- FROM split_records(
+      --   columns=["_", "sl", "local_address", "rem_address", "st", "queues",
+      --            "tr_tm_when", "retransmit", "uid", "timeout", "inode"],
+      --   filenames="/proc/net/tcp",
+      --   regex=" +")
+      -- WHERE sl =~ ":"
+      --   AND State =~ ConnectionStatusRegex
+      -- -- TODO: Add /proc/net/tcp6 for IPv6, /proc/net/udp for UDP
+
+column_types:
+  - name: ChildrenTree
+    type: tree

@@ -1,0 +1,173 @@
+# Template: Server Client and Flow Data Query
+# Platform: server
+# Use when: Querying client inventory, listing flows, or retrieving historical artifact results
+
+# =============================================================================
+# Based on: Server.Information.Clients, Server.Information.Users
+#
+# Patterns demonstrated:
+#   - type: SERVER for on-demand queries
+#   - clients(search=) for bulk client search with metadata
+#   - client_info(client_id=) for fast single-client lookup
+#   - flows(client_id=) for listing flows per client
+#   - source(client_id=, flow_id=, artifact=) for historical artifact data
+#   - timestamp(epoch=last_seen_at / 1000000) — last_seen_at is microseconds
+#   - Filtering: OS, label, last seen days, artifact name
+#   - GROUP BY aggregation for client statistics
+#
+# Key: last_seen_at is in MICROSECONDS (not seconds)
+#   Always divide by 1000000 before passing to timestamp()
+#   Days since: (now() - last_seen_at / 1000000) / 86400
+#
+# clients() vs client_info():
+#   clients(search=) — searches all clients, multiple results, good for bulk
+#   client_info(client_id=) — fast single-client lookup when ID is known
+# =============================================================================
+
+name: Server.Information.ArtifactName # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what client or flow data this artifact queries.
+
+  Describe: what information is retrieved from the server (client list, flows,
+  historical artifact data), what filters apply, and the use case.
+
+type: SERVER                           # On-demand query
+author: TODO Author Name - @handle
+
+parameters:
+  - name: ClientSearch
+    description: |
+      Search query for clients. Examples:
+        "host:workstation-1", "label:Production", "all"
+      Leave empty to list all clients.
+
+  - name: OSFilter
+    type: regex
+    description: Filter by OS (regex). Examples: "windows", "linux", "darwin".
+    default: "."
+
+  - name: LastSeenDays
+    type: int
+    description: Only show clients seen within the last N days. 0 = all clients.
+    default: "0"
+
+  - name: IncludeFlows
+    type: bool
+    description: Include all flows for each client.
+    default: N
+
+  - name: IncludeFlowData
+    type: bool
+    description: Include artifact data from completed flows (requires IncludeFlows).
+    default: N
+
+  - name: ArtifactNameRegex
+    type: regex
+    description: Filter flows by artifact name (regex). Only applies if IncludeFlows is set.
+    default: "."
+
+  - name: MaxClients
+    type: int
+    description: Maximum number of clients to return. 0 = unlimited.
+    default: "0"
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN 1: List all clients with OS info and last seen
+      -- =====================================================================
+      LET all_clients = SELECT
+          client_id,
+          os_info.fqdn AS FQDN,
+          os_info.system AS OS,
+          os_info.release AS OSRelease,
+          os_info.machine AS Architecture,
+          last_ip AS LastIP,
+          -- last_seen_at is in MICROSECONDS — divide by 1000000 for epoch seconds
+          timestamp(epoch=last_seen_at / 1000000) AS LastSeen,
+          (now() - last_seen_at / 1000000) / 86400 AS DaysSinceLastSeen,
+          labels AS Labels,
+          first_seen_at
+        FROM clients(search=ClientSearch)
+        WHERE
+          os_info.system =~ OSFilter
+          AND if(condition=LastSeenDays > 0,
+                 then=(now() - last_seen_at / 1000000) / 86400 < LastSeenDays,
+                 else=TRUE)
+        LIMIT if(condition=MaxClients > 0, then=MaxClients, else=999999)
+
+      -- =====================================================================
+      -- PATTERN 2: List flows for each client
+      -- =====================================================================
+      LET client_flows = SELECT * FROM foreach(
+        row=all_clients,
+        query={
+          SELECT client_id, FQDN, OS,
+                 session_id AS FlowId,
+                 timestamp(epoch=create_time) AS FlowCreated,
+                 timestamp(epoch=active_time) AS FlowActive,
+                 state AS FlowState,
+                 join(array=request.artifacts, sep=", ") AS Artifacts,
+                 join(array=artifacts_with_results, sep=", ") AS ArtifactsWithResults,
+                 total_collected_rows AS Rows,
+                 total_uploaded_bytes AS Bytes
+            FROM flows(client_id=client_id)
+            WHERE join(array=request.artifacts, sep=", ") =~ ArtifactNameRegex
+        })
+
+      -- =====================================================================
+      -- PATTERN 3: Retrieve artifact data from completed flows
+      -- source() returns the actual rows collected by the artifact
+      -- =====================================================================
+      LET flow_data = SELECT * FROM foreach(
+        row=client_flows,
+        query={
+          SELECT * FROM foreach(
+            row=split(string=ArtifactsWithResults, sep=", "),
+            query={
+              SELECT client_id, FQDN, FlowId, _value AS ArtifactName, *
+                FROM source(
+                  client_id=client_id,
+                  flow_id=FlowId,
+                  artifact=_value)
+                  -- source= can specify a named source within the artifact
+            })
+        })
+
+      -- Return results based on what was requested
+      SELECT * FROM if(
+        condition=IncludeFlowData,
+        then={SELECT * FROM flow_data},
+        else={
+          SELECT * FROM if(
+            condition=IncludeFlows,
+            then={SELECT * FROM client_flows},
+            else={SELECT * FROM all_clients}
+          )
+        })
+
+      -- =====================================================================
+      -- PATTERN 4: Aggregate client statistics (commented out)
+      -- Uncomment and replace the main query for a summary view:
+      -- =====================================================================
+      -- LET by_os = SELECT OS, count() AS Count
+      --   FROM all_clients
+      --   GROUP BY OS
+      --
+      -- LET by_status = SELECT
+      --     if(condition=DaysSinceLastSeen < 1, then="Online", else="Offline") AS Status,
+      --     count() AS Count
+      --   FROM all_clients
+      --   GROUP BY Status
+      --
+      -- SELECT * FROM chain(
+      --   os_stats={SELECT "OS Distribution" AS Category, OS AS Value, Count FROM by_os},
+      --   status_stats={SELECT "Client Status" AS Category, Status AS Value, Count FROM by_status})
+
+column_types:
+  - name: LastSeen
+    type: timestamp
+  - name: FlowCreated
+    type: timestamp
+  - name: FlowActive
+    type: timestamp

@@ -1,0 +1,114 @@
+# Template: Base Client Artifact
+# Platform: common
+# Use when: Starting any new CLIENT or CLIENT_EVENT artifact from scratch
+
+# =============================================================================
+# This is the minimal scaffold for a Velociraptor client artifact.
+# It demonstrates the full YAML schema with all commonly needed fields.
+# Remove sections that are not needed for your specific artifact.
+#
+# For platform-specific patterns, also read:
+#   - templates/windows/ for registry, EVTX, ETW, WMI, NTFS patterns
+#   - templates/macos/  for plist, SQLite, binary format patterns
+#   - templates/linux/  for journald, eBPF, /proc, package patterns
+# =============================================================================
+
+name: Platform.Category.ArtifactName   # TODO: Set name (e.g., Linux.Sys.Users)
+description: |
+  TODO: One-line summary of what this artifact collects or detects.
+
+  Longer explanation of:
+  - What data sources are queried
+  - What filtering is applied
+  - How results should be interpreted
+  - Any performance considerations or dependencies
+
+  ## NOTES
+  - Note any important caveats or requirements here.
+
+type: CLIENT                            # CLIENT (default) or CLIENT_EVENT for monitoring
+
+author: TODO Author Name - @handle      # TODO: Set your name and handle
+
+reference:
+  - https://example.com/relevant-doc    # TODO: Add references or remove this section
+
+# Precondition: skip artifact if this query returns 0 rows.
+# Use OS =~ 'linux' | 'darwin' | 'windows' as appropriate.
+# Server artifacts have NO precondition.
+precondition: |
+  SELECT OS FROM info() WHERE OS =~ 'linux'  # TODO: Set for your platform
+
+parameters:
+  # -- Primary search/filter parameter --
+  - name: SearchGlob
+    default: /etc/**
+    description: Glob pattern for files to examine.
+    # TODO: Set a meaningful default for your use case
+
+  # -- Optional regex filter --
+  - name: FilterRegex
+    type: regex
+    default: .
+    description: Only return rows matching this pattern.
+
+  # -- Optional date range filter --
+  - name: DateAfter
+    type: timestamp
+    description: "Only return results after this date. YYYY-MM-DDTmm:hh:ssZ"
+
+  - name: DateBefore
+    type: timestamp
+    description: "Only return results before this date. YYYY-MM-DDTmm:hh:ssZ"
+
+  # -- Upload toggle (add if collecting files) --
+  # - name: Upload_File
+  #   type: bool
+  #   default: N
+  #   description: Upload matching files to the server.
+
+# Uncomment if using execve() for safe/read-only commands:
+# implied_permissions:
+#   - EXECVE
+
+# Uncomment if using execve() for dangerous/modifying commands:
+# required_permissions:
+#   - EXECVE
+
+# Uncomment if writing temp files (packet capture, memory dump):
+# implied_permissions:
+#   - FILESYSTEM_WRITE
+
+# Uncomment if fetching an external tool binary:
+# tools:
+#   - name: ToolName
+#     github_project: Org/Repo
+#     github_asset_regex: linux-amd64
+
+sources:
+  - query: |
+      -- Step 1: Materialize expensive or reused lookups
+      -- LET lookup <= dict(key1="value1", key2="value2")
+
+      -- Step 2: Build date sentinels for optional timestamp filtering
+      LET DateAfterTime <= if(condition=DateAfter,
+        then=DateAfter, else=timestamp(epoch="1600-01-01"))
+      LET DateBeforeTime <= if(condition=DateBefore,
+        then=DateBefore, else=timestamp(epoch="2200-01-01"))
+
+      -- Step 3: Main query
+      -- TODO: Replace with your actual data collection logic
+      SELECT OSPath,
+             Mtime AS ModifiedTime,
+             Size
+      FROM glob(globs=SearchGlob)
+      WHERE OSPath =~ FilterRegex
+        AND ModifiedTime > DateAfterTime
+        AND ModifiedTime < DateBeforeTime
+
+# Uncomment and set column_types for any non-obvious GUI rendering:
+# column_types:
+#   - name: ModifiedTime
+#     type: timestamp
+#   - name: Upload
+#     type: preview_upload

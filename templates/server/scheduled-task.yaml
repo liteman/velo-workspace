@@ -1,0 +1,205 @@
+# Template: Server Scheduled Task
+# Platform: server
+# Use when: Executing periodic server actions (scheduled hunts, metrics, cleanup, notifications)
+
+# =============================================================================
+# Based on: Server.Monitoring.ScheduleHunt, Server.Monitoring.ClientCount
+#
+# Patterns demonstrated:
+#   - type: SERVER_EVENT with clock(period=) for timer-based triggers
+#   - timestamp(epoch=now()).Weekday.String for day-of-week matching
+#   - timestamp(epoch=now()).UTC.String for time matching
+#   - hunt() for launching periodic hunts
+#   - Artifact.Server.Monitor.VeloMetrics() for calling other server artifacts
+#   - mail() for periodic status emails with period= debouncing
+#   - delete_flow() / delete_events() for retention cleanup (MACHINE_STATE)
+#
+# Scheduling mechanics:
+#   - clock(period=60) fires every 60 seconds
+#   - Day matching: timestamp().Weekday.String =~ "Tuesday"
+#   - Time matching: timestamp().UTC.String =~ "01:28:[0-9][0-9]"
+#   - Combine with AND for cron-like "Tuesday at 01:28" behavior
+#   - Use ".*" for ScheduleDayRegex to match every day
+#
+# WARNING for cleanup patterns:
+#   - delete_flow(really_do_it=TRUE) is irreversible
+#   - Always provide ReallyDoIt boolean parameter (default N = dry run)
+#   - Requires MACHINE_STATE permission for deletion operations
+# =============================================================================
+
+name: Server.Monitoring.ArtifactName  # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what this scheduled task does.
+
+  Describe: what action is taken, when it runs (schedule), and any
+  configuration required.
+
+  ## Scheduling
+
+  Configure via parameters:
+  - ScheduleDayRegex: day of week (e.g., "Tuesday", "Monday|Friday", ".*")
+  - ScheduleTimeRegex: HH:MM in UTC (e.g., "01:28")
+  - Period: check interval in seconds (default 60)
+
+type: SERVER_EVENT                     # Required for continuous execution
+author: TODO Author Name - @handle
+
+parameters:
+  - name: Period
+    description: Clock check interval in seconds.
+    type: int
+    default: "60"
+
+  - name: ScheduleDayRegex
+    type: regex
+    description: Day of week to run. Use ".*" for every day.
+    default: "Tuesday"
+
+  - name: ScheduleTimeRegex
+    type: regex
+    description: Time in HH:MM UTC format. Matched with seconds wildcard appended.
+    default: "01:28"
+
+  # TODO: Add parameters for your scheduled action:
+
+  - name: HuntDescription
+    description: Description for the scheduled hunt.
+    default: "Periodic info hunt"
+
+  - name: ArtifactName
+    description: Artifact to collect in the scheduled hunt.
+    default: "Generic.Client.Info"
+
+  # Email notification (uncomment if using mail pattern):
+  # - name: EmailAddress
+  #   description: Email address for periodic status notifications.
+
+  # Cleanup (uncomment if using cleanup pattern):
+  # - name: RetentionDays
+  #   type: int
+  #   description: Delete flows older than this many days.
+  #   default: "90"
+  # - name: ReallyDoIt
+  #   type: bool
+  #   description: Actually perform cleanup (default N = dry run).
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN 1: Scheduled hunt launch (day + time matching)
+      -- Fires every Period seconds, executes hunt when day and time match.
+      -- =====================================================================
+      SELECT * FROM foreach(
+        row={
+          SELECT timestamp(epoch=now()) AS Now
+          FROM clock(period=Period)
+          WHERE
+            if(condition=ScheduleDayRegex,
+               then=timestamp(epoch=now()).Weekday.String =~ ScheduleDayRegex,
+               else=TRUE)
+            AND if(condition=ScheduleTimeRegex,
+                   then=timestamp(epoch=now()).UTC.String =~ ScheduleTimeRegex + ":[0-9][0-9]",
+                   else=TRUE)
+        },
+        query={
+          SELECT hunt(
+              description=HuntDescription,
+              artifacts=[ArtifactName],
+              spec=dict()) AS Hunt,
+            Now
+          FROM scope()
+          WHERE log(message=format(format="Launching scheduled hunt at %v", args=[Now]))
+        })
+
+      -- =====================================================================
+      -- PATTERN 2: Simple periodic execution (no day/time filtering)
+      -- Fires every Period seconds. Good for metrics collection, health checks.
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT * FROM clock(period=Period)},
+      --   query={
+      --     -- Call another server artifact periodically
+      --     SELECT * FROM Artifact.Server.Monitor.VeloMetrics()
+      --     -- TODO: Replace with your artifact call
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 3: Periodic email notification with server metrics
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={
+      --     SELECT timestamp(epoch=now()) AS Now
+      --     FROM clock(period=Period)
+      --     WHERE timestamp(epoch=now()).Weekday.String =~ ScheduleDayRegex
+      --       AND timestamp(epoch=now()).UTC.String =~ ScheduleTimeRegex + ":[0-9][0-9]"
+      --   },
+      --   query={
+      --     LET metrics <= SELECT * FROM Artifact.Server.Monitor.VeloMetrics() LIMIT 1
+      --     SELECT mail(
+      --         to=EmailAddress,
+      --         subject=format(format="Server Status - %v", args=[Now]),
+      --         body=format(format="Connected Clients: %v\nCPU: %v%%\nMemory: %v MB",
+      --                     args=[metrics.client_comms_current_connections,
+      --                           metrics.process_cpu_percent,
+      --                           metrics.process_memory_rss / 1024 / 1024]),
+      --         period=60) AS EmailResult   -- Debounce: max 1 email per 60 seconds
+      --     FROM scope()
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 4: Periodic data cleanup (delete old flows)
+      -- Requires MACHINE_STATE permission. Always use ReallyDoIt safety check.
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={
+      --     SELECT timestamp(epoch=now()) AS Now
+      --     FROM clock(period=Period)
+      --     WHERE timestamp(epoch=now()).Weekday.String =~ ScheduleDayRegex
+      --       AND timestamp(epoch=now()).UTC.String =~ ScheduleTimeRegex + ":[0-9][0-9]"
+      --   },
+      --   query={
+      --     LET cutoff <= timestamp(epoch=now() - (RetentionDays * 86400))
+      --
+      --     LET old_flows = SELECT client_id, session_id AS flow_id,
+      --         timestamp(epoch=create_time) AS Created
+      --       FROM foreach(
+      --         row={SELECT client_id FROM clients()},
+      --         query={
+      --           SELECT *, client_id FROM flows(client_id=client_id)
+      --           WHERE timestamp(epoch=create_time) < cutoff
+      --         })
+      --
+      --     SELECT client_id, flow_id, Created,
+      --       if(condition=ReallyDoIt,
+      --          then=delete_flow(client_id=client_id, flow_id=flow_id, really_do_it=TRUE),
+      --          else="Dry run - would delete") AS DeleteResult
+      --     FROM old_flows
+      --     WHERE log(message=format(format="Processing %v/%v created %v",
+      --                              args=[client_id, flow_id, Created]))
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 5: Periodic collection on labeled clients
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={
+      --     SELECT timestamp(epoch=now()) AS Now
+      --     FROM clock(period=Period)
+      --     WHERE timestamp(epoch=now()).Weekday.String =~ ScheduleDayRegex
+      --       AND timestamp(epoch=now()).UTC.String =~ ScheduleTimeRegex + ":[0-9][0-9]"
+      --   },
+      --   query={
+      --     LET target_clients = SELECT client_id,
+      --         client_info(client_id=client_id).os_info.fqdn AS FQDN
+      --       FROM clients(search="label:PeriodicCollection")
+      --
+      --     SELECT FQDN,
+      --       collect_client(client_id=client_id,
+      --                      artifacts=[ArtifactName], env=dict()) AS Collection
+      --     FROM target_clients
+      --     WHERE log(message=format(format="Scheduling collection on %v", args=[FQDN]))
+      --   })

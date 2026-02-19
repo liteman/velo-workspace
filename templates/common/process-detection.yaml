@@ -1,0 +1,136 @@
+# Template: Process Detection
+# Platform: common
+# Use when: Scanning running processes with YARA, detecting suspicious processes, or enriching process data
+
+# =============================================================================
+# Cross-platform process detection template. Consolidates patterns from:
+#   - Windows.Detection.BinaryHunter
+#   - Linux.Detection.Yara.Process
+#   - Windows.Attack.ParentProcess
+#
+# Core pattern (identical across platforms):
+#   pslist() / process_tracker_pslist() → optional YARA → optional PE analysis
+#
+# Platform-specific notes:
+#   Windows: Add parse_pe() for PE header analysis, authenticode() for signature check.
+#            Use proc_dump(pid=Pid) for memory acquisition.
+#   Linux:   process_tracker_* requires Linux.Events.TrackProcesses running as CLIENT_EVENT.
+#            Add deleted-executable detection via /proc/Pid/exe =~ "deleted".
+#   macOS:   process_tracker_* available via process_tracker() initialization.
+#            Add xattr() for quarantine flag detection.
+# =============================================================================
+
+name: Platform.Detection.ArtifactName  # TODO: e.g., Linux.Detection.Yara.Process
+description: |
+  TODO: One-line summary of what processes this artifact detects or analyzes.
+
+  Describe:
+  - The detection criteria (YARA rules, process name patterns, suspicious behaviors)
+  - The enrichment applied (call chain, parent process, memory scanning)
+  - Any dependencies (process tracker must be running)
+
+type: CLIENT
+
+author: TODO Author Name - @handle
+
+precondition: |
+  SELECT OS FROM info() WHERE OS =~ 'linux'   # TODO: Set for your platform
+
+parameters:
+  # -- Process filter --
+  - name: ProcessRegex
+    type: regex
+    default: .
+    description: Filter processes by name (default matches all).
+
+  # -- YARA rule for memory scanning --
+  - name: YaraRule
+    type: yara
+    default: |
+      rule IsPE {
+        meta: description = "Match PE header (for cross-platform testing)"
+        condition: uint16(0) == 0x5A4D
+      }
+    description: YARA rule to scan process memory. Leave empty to skip scanning.
+
+  # -- Enrichment options --
+  - name: IncludeCallChain
+    type: bool
+    default: N
+    description: Include process call chain (requires process_tracker to be running).
+
+  - name: IncludeProcessTree
+    type: bool
+    default: N
+    description: Include child process tree (requires process_tracker to be running).
+
+  # -- YARA hit limit --
+  - name: NumberOfHits
+    type: int64
+    default: 1
+    description: Stop scanning a process after this many YARA hits.
+
+sources:
+  - query: |
+      -- Step 1: Get running processes filtered by name
+      LET processes = SELECT Pid, Ppid, Name, Exe, CommandLine, Username,
+               CreateTime AS StartTime
+        FROM pslist()
+        WHERE Name =~ ProcessRegex
+          AND Pid != getpid()  -- Exclude ourselves
+          -- TODO: Add other filters as needed:
+          -- AND NOT Name =~ "^(systemd|kthread|kworker)$"
+
+      -- Step 2: Enrich with process tracker (if available)
+      -- NOTE: process_tracker_* requires TrackProcesses artifact to be running.
+      LET enriched = SELECT *,
+             if(condition=IncludeCallChain,
+                then=join(array=process_tracker_callchain(id=Pid).Data.Name,
+                          sep=" -> ")) AS CallChain,
+             if(condition=IncludeProcessTree,
+                then=process_tracker_tree(id=Pid)) AS ChildrenTree
+        FROM processes
+
+      -- Step 3: Optional YARA memory scanning
+      SELECT * FROM if(
+        condition=YaraRule,
+        then={
+          -- Scan each process's memory for YARA matches
+          SELECT * FROM foreach(
+            row=enriched,
+            query={
+              SELECT Pid, Ppid, Name, Exe, CommandLine, Username, StartTime,
+                     CallChain, ChildrenTree,
+                     Rule AS YaraRule,
+                     String.Offset AS HitOffset,
+                     str(str=String.Data) AS HitContext
+              FROM proc_yara(pid=Pid, rules=YaraRule, number=NumberOfHits)
+            })
+        },
+        else={
+          -- No YARA: return all processes with enrichment
+          SELECT Pid, Ppid, Name, Exe, CommandLine, Username, StartTime,
+                 CallChain, ChildrenTree,
+                 NULL AS YaraRule, NULL AS HitOffset, NULL AS HitContext
+          FROM enriched
+        })
+
+      -- -----------------------------------------------------------------------
+      -- Windows platform additions (uncomment and adapt):
+      -- -----------------------------------------------------------------------
+      -- Add PE analysis after process list:
+      -- LET pe_info = SELECT *, parse_pe(file=Exe) AS PE,
+      --               authenticode(filename=Exe) AS Signature
+      -- FROM processes WHERE Exe
+      --
+      -- -----------------------------------------------------------------------
+      -- Linux deleted-executable detection (uncomment and adapt):
+      -- -----------------------------------------------------------------------
+      -- Add to WHERE clause in processes query:
+      -- OR Exe =~ " (deleted)$"  -- Running from deleted executable
+
+column_types:
+  - name: StartTime
+    type: timestamp
+  - name: ChildrenTree
+    type: tree

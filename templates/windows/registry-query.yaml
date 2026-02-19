@@ -1,0 +1,109 @@
+# Template: Windows Registry Query
+# Platform: windows
+# Use when: Enumerating registry keys/values, reading values under matching keys, or parsing offline registry hives
+
+# =============================================================================
+# Based on: Windows.Sys.Programs, Windows.Sys.StartupItems,
+#           Windows.Sys.FirewallRules, Windows.Registry.NTUser
+#
+# Patterns demonstrated:
+#   A. glob(accessor="registry") — enumerate keys/values by glob pattern
+#   B. read_reg_key() — read all named values under matching keys as columns
+#   C. raw_reg accessor — offline hive reading (NTUser.dat, Amcache.hve)
+#   D. CSV table of registry globs — multiple unrelated glob patterns
+# =============================================================================
+
+name: Windows.Registry.ArtifactName    # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what registry data this artifact collects.
+
+  Describe: which registry hives/keys are queried, the forensic value,
+  and any caveats (e.g., HKU hives require logged-in users).
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'windows'
+
+parameters:
+  # Pattern A: Single glob pattern
+  - name: RegistryGlob
+    description: Glob pattern to enumerate registry keys and values.
+    default: HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\*
+    # TODO: Set the registry path for your use case
+
+  # Pattern B: Comma-separated key paths (for read_reg_key)
+  # - name: RegistryKeys
+  #   description: Comma-separated registry key paths.
+  #   default: >-
+  #     HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*,
+  #     HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*
+
+  # Pattern D: CSV table of registry globs
+  # - name: RegistryGlobs
+  #   type: csv
+  #   default: |
+  #     KeyGlobs
+  #     HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run*\*
+  #     HKEY_USERS\*\SOFTWARE\Microsoft\Windows\CurrentVersion\Run*\*
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: glob with registry accessor
+      -- Returns: OSPath, Name, Data, Mtime (of the parent key)
+      -- Use for: enumerating values by glob pattern
+      -- =====================================================================
+      SELECT Name,
+             Data.value AS Value,
+             OSPath,
+             Mtime AS KeyLastWriteTime
+      FROM glob(globs=RegistryGlob, accessor="registry")
+
+      -- =====================================================================
+      -- PATTERN B: read_reg_key (returns all values as columns)
+      -- Use for: getting DisplayName, Publisher, InstallDate etc. directly
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT Key.Name AS KeyName,
+      --        Key.Mtime AS KeyLastWriteTime,
+      --        DisplayName, DisplayVersion, Publisher,
+      --        UninstallString, InstallLocation, InstallDate,
+      --        Key.OSPath AS KeyPath
+      -- FROM read_reg_key(
+      --   globs=split(string=RegistryKeys, sep=',[\\s]*'),
+      --   accessor="registry")
+
+      -- =====================================================================
+      -- PATTERN C: raw_reg accessor for offline hive reading
+      -- Use for: NTUser.dat, Amcache.hve, any locked/offline hive
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- LET UserProfiles = SELECT Name AS Username,
+      --       {SELECT OSPath FROM glob(
+      --         root=expand(path=Directory), globs="/NTUSER.DAT")} AS HivePath,
+      --       expand(path=Directory) AS Directory
+      -- FROM Artifact.Windows.Sys.Users()
+      -- WHERE HivePath
+      --
+      -- SELECT * FROM foreach(
+      --   row=UserProfiles,
+      --   query={
+      --     SELECT Username, OSPath, Data, Mtime AS KeyLastWriteTime
+      --     FROM glob(
+      --       globs=KeyGlob,
+      --       root=pathspec(DelegateAccessor="ntfs", DelegatePath=HivePath, Path="/"),
+      --       accessor="raw_reg")
+      --   })
+
+      -- =====================================================================
+      -- PATTERN D: CSV table of registry globs
+      -- Use for: multiple unrelated glob patterns
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT Name, OSPath, Data.value AS Details, Mtime AS KeyLastWriteTime
+      -- FROM glob(globs=RegistryGlobs.KeyGlobs, accessor="registry")
+
+column_types:
+  - name: KeyLastWriteTime
+    type: timestamp

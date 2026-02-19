@@ -1,0 +1,161 @@
+# Template: File Search with Enrichment
+# Platform: common
+# Use when: Searching for files by glob pattern with optional YARA scanning, hashing, and upload
+
+# =============================================================================
+# Cross-platform file search template. Consolidates patterns from:
+#   - Windows.Search.FileFinder
+#   - MacOS.Search.FileFinder
+#   - Linux.Search.FileFinder
+#
+# Core pattern (identical across platforms):
+#   glob() → timestamp filter → optional YARA → optional hash → optional upload
+#
+# Platform-specific notes:
+#   Windows: Use Accessor parameter (auto/file/ntfs/ntfs_vss) for locked files.
+#            Add VSSAnalysisAge + GROUP BY for VSS deduplication.
+#   Linux:   Add LocalFilesystemOnly + DevMajor filtering via recursion_callback.
+#            See templates/linux/file-search-enrichment.yaml for full pattern.
+#   macOS:   Add DoNotFollowSymlinks=Y by default.
+# =============================================================================
+
+name: Platform.Search.ArtifactName     # TODO: e.g., Linux.Search.SuspiciousFiles
+description: |
+  TODO: One-line summary of what files this artifact searches for.
+
+  Describe:
+  - The target files (name patterns, locations, content)
+  - What enrichment is applied (YARA, hashing, upload)
+  - Any performance considerations
+
+  Performance Note: YARA scanning opens and reads each matching file.
+  Use ops_per_second rate limiting when collecting at scale.
+
+type: CLIENT
+
+author: TODO Author Name - @handle
+
+precondition: |
+  SELECT OS FROM info() WHERE OS =~ 'linux'   # TODO: Set for your platform
+
+parameters:
+  # -- Primary search globs (CSV table of paths) --
+  - name: SearchFilesGlobTable
+    type: csv
+    default: |
+      Glob
+      /home/**
+      /tmp/**
+    description: CSV table of glob patterns to search.
+    # TODO: Set meaningful default search paths for your use case
+
+  # -- YARA content matching --
+  - name: YaraRule
+    type: yara
+    default:
+    description: YARA rule for content-based file matching. Leave empty to skip.
+
+  # -- Enrichment toggles --
+  - name: Upload_File
+    type: bool
+    default: N
+    description: Upload matching files to the server.
+
+  - name: Calculate_Hash
+    type: bool
+    default: N
+    description: Calculate MD5, SHA1, SHA256 hashes of matching files.
+
+  # -- Date range filter --
+  - name: MoreRecentThan
+    type: timestamp
+    default: ""
+    description: Only return files modified after this timestamp.
+
+  - name: ModifiedBefore
+    type: timestamp
+    default: ""
+    description: Only return files modified before this timestamp.
+
+  # -- Regex filter --
+  - name: PathRegex
+    type: regex
+    default: .
+    description: Additional regex filter applied to file paths.
+
+sources:
+  - query: |
+      -- Step 1: Find files matching glob patterns
+      LET file_search = SELECT OSPath,
+               Mode.String AS Mode, Size,
+               Mtime AS MTime,
+               Atime AS ATime,
+               Ctime AS CTime,
+               Btime AS BTime,
+               IsDir, Data
+        FROM glob(globs=SearchFilesGlobTable.Glob)
+        WHERE OSPath =~ PathRegex
+
+      -- Step 2: Apply date filters (chained if() plugin calls)
+      LET more_recent = SELECT * FROM if(
+        condition=MoreRecentThan,
+        then={SELECT * FROM file_search WHERE MTime > MoreRecentThan},
+        else={SELECT * FROM file_search})
+
+      LET date_filtered = SELECT * FROM if(
+        condition=ModifiedBefore,
+        then={SELECT * FROM more_recent WHERE MTime < ModifiedBefore},
+        else={SELECT * FROM more_recent})
+
+      -- Step 3: Optional YARA content scanning
+      -- Only runs if YaraRule parameter is provided.
+      -- Returns only YARA-matching files if rule is set.
+      LET keyword_search = SELECT * FROM if(
+        condition=YaraRule,
+        then={
+          SELECT * FROM foreach(
+            row={SELECT * FROM date_filtered WHERE NOT IsDir},
+            query={
+              SELECT OSPath, Mode, Size, MTime, ATime, CTime, BTime,
+                     str(str=String.Data) AS Keywords, IsDir, Data
+              FROM yara(files=OSPath, key="A", rules=YaraRule)
+            })
+        },
+        else={SELECT *, NULL AS Keywords FROM date_filtered})
+
+      -- Step 4: Final output with conditional enrichment
+      SELECT OSPath, Mode, Size, MTime, ATime, CTime, BTime, Keywords,
+             if(condition=Upload_File AND NOT IsDir,
+                then=upload(file=OSPath,
+                            mtime=MTime, atime=ATime, ctime=CTime)) AS Upload,
+             if(condition=Calculate_Hash AND NOT IsDir,
+                then=hash(path=OSPath)) AS Hash
+      FROM keyword_search
+
+      -- -----------------------------------------------------------------------
+      -- Windows platform additions (uncomment and adapt):
+      -- -----------------------------------------------------------------------
+      -- Add Accessor parameter (auto/file/ntfs/ntfs_vss) to glob() and hash()
+      -- For VSS support, add GROUP BY OSPath to deduplicate across snapshots
+      --
+      -- -----------------------------------------------------------------------
+      -- Linux platform additions (uncomment and adapt):
+      -- -----------------------------------------------------------------------
+      -- Add LocalFilesystemOnly bool parameter + DevMajor filtering
+      -- LET LocalDeviceMajor <= (253, 7, 8, 9, 11, ...)
+      -- LET RecursionCallback = if(condition=LocalFilesystemOnly,
+      --   then="x=>x.Data.DevMajor IN LocalDeviceMajor",
+      --   else="")
+      -- Use in: glob(globs=..., recursion_callback=RecursionCallback)
+
+column_types:
+  - name: MTime
+    type: timestamp
+  - name: ATime
+    type: timestamp
+  - name: CTime
+    type: timestamp
+  - name: BTime
+    type: timestamp
+  - name: Upload
+    type: preview_upload

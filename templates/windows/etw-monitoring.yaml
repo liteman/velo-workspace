@@ -1,0 +1,108 @@
+# Template: Windows ETW Real-Time Monitoring
+# Platform: windows
+# Use when: Subscribing to ETW (Event Tracing for Windows) providers for real-time kernel or application events
+
+# =============================================================================
+# Based on: Windows.ETW.DNS, Windows.ETW.KernelFile, Windows.ETW.KernelProcess
+#
+# Patterns demonstrated:
+#   A. ETW provider subscription by GUID
+#   B. ETW with keyword/event ID filtering
+#   C. ETW with process_tracker enrichment (add delay for sync)
+#
+# Common ETW Providers:
+#   DNS Client:       {1C95126E-7EEA-49A9-A3FE-A378B03DDB4D}
+#   Kernel-File:      {EDD08927-9CC4-4E65-B970-C2560FB5C289}
+#   Kernel-Network:   {7DD42A49-5329-4832-8DFD-43D979153A88}
+#   Kernel-Process:   {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
+#   Kernel-Registry:  {70EB4F03-C1DE-4F73-A051-33D13D5413BD}
+#   Sysmon:           {5770385F-C22A-43E0-BF4C-06F5698FFBD9}
+# =============================================================================
+
+name: Windows.ETW.ArtifactName         # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what ETW events this artifact monitors.
+
+  Describe: the ETW provider subscribed to, which events are captured,
+  and what detection or monitoring value this provides.
+
+type: CLIENT_EVENT                      # ETW monitoring always uses CLIENT_EVENT
+
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'windows'
+
+parameters:
+  - name: ETWProviderGUID
+    description: GUID of the ETW provider to subscribe to.
+    default: "{1C95126E-7EEA-49A9-A3FE-A378B03DDB4D}"   # DNS Client
+    # TODO: Set to your provider GUID
+
+  - name: ETWKeyword
+    type: int64
+    default: "0"
+    description: ETW keyword bitmask for filtering (0 = all events).
+    # Common keywords for Kernel-File: 0x1490 (FILENAME|CREATE|DELETE_PATH)
+
+  - name: ExcludeRegex
+    type: regex
+    default: "^$"
+    description: Regex to exclude matching events (e.g., known-good processes).
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: Basic ETW subscription
+      -- =====================================================================
+      -- Add delay to let the ETW program initialize before event capture
+      SELECT * FROM delay(delay=2, query={
+        SELECT System.Timestamp AS EventTime,
+               System.ID AS EventID,
+               System.ProcessID AS Pid,
+               System.ProcessName AS ProcessName,
+               EventData
+        FROM watch_etw(
+          guid=ETWProviderGUID,
+          any=ETWKeyword)
+        WHERE NOT ProcessName =~ ExcludeRegex
+          -- TODO: Add specific Event ID filtering:
+          -- AND System.ID IN (3008, 3011)
+      })
+
+      -- =====================================================================
+      -- PATTERN B: ETW with process_tracker enrichment
+      -- Requires: process_tracker to be initialized (via process_tracker())
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- LET ETW = SELECT * FROM watch_etw(
+      --   guid=ETWProviderGUID,
+      --   any=ETWKeyword)
+      --
+      -- SELECT * FROM foreach(
+      --   row={SELECT * FROM delay(query=ETW, delay=3)},
+      --   query={
+      --     SELECT System.Timestamp AS EventTime,
+      --            System.ID AS EventID,
+      --            System.ProcessID AS Pid,
+      --            process_tracker_get(id=System.ProcessID).Data.Name AS ProcessName,
+      --            process_tracker_get(id=System.ProcessID).Data.Exe AS Exe,
+      --            join(array=process_tracker_callchain(id=System.ProcessID).Data.Name,
+      --                 sep=" -> ") AS CallChain,
+      --            EventData
+      --     FROM scope()
+      --   })
+
+      -- =====================================================================
+      -- PATTERN C: ETW with Event ID lookup table
+      -- Uncomment and add to Pattern A or B:
+      -- =====================================================================
+      -- LET EIDLookup <= dict(
+      --   `10`="NameCreate", `11`="NameDelete", `12`="FileOpen",
+      --   `19`="Rename", `27`="RenamePath", `30`="CreateNewFile")
+      --
+      -- -- In the SELECT:
+      -- get(item=EIDLookup, field=str(str=System.ID)) AS EventType,
+
+column_types:
+  - name: EventTime
+    type: timestamp

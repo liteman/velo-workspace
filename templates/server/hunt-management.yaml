@@ -1,0 +1,190 @@
+# Template: Server Hunt Management
+# Platform: server
+# Use when: Creating, listing, querying results from, or managing Velociraptor hunts
+
+# =============================================================================
+# Based on: Server.Hunts.List, Server.Utils.StartHuntExample,
+#           Server.Monitoring.ScheduleHunt
+#
+# Patterns demonstrated:
+#   - hunt(description=, artifacts=, spec=) to create and start a hunt
+#   - hunts() to list all hunts with metadata and statistics
+#   - hunt_results(hunt_id=, artifact=) to retrieve collected data
+#   - hunt_flows(hunt_id=) to enumerate per-client flows
+#   - hunt_add(hunt_id=, client_id=, flow_id=) to add flows to existing hunt
+#   - hunt_delete(hunt_id=, really_do_it=) for cleanup
+#   - impersonate block for privilege delegation to low-privileged users
+#   - clock()-based scheduling pattern (see SCHEDULED HUNT notes)
+#
+# Hunt spec format:
+#   spec=dict(`Artifact.Name`=dict(Param="value"))
+#   Backtick-quote artifact names with dots in them
+#   Empty dict for no parameters: dict(`Generic.Client.Info`=dict())
+#
+# Timestamp handling:
+#   hunt.create_time, hunt.start_time: epoch seconds (no division)
+#   hunt_flows: create_time, active_time: microseconds (divide by 1000000)
+# =============================================================================
+
+name: Server.Hunts.ArtifactName       # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what hunt operations this artifact performs.
+
+  Describe: whether it creates new hunts, lists existing ones, or retrieves
+  results. Include scheduling behavior and required permissions.
+
+type: SERVER                           # Use SERVER_EVENT for scheduled hunts
+author: TODO Author Name - @handle
+
+# Uncomment for privilege delegation (allows analyst role to create hunts):
+# impersonate:
+#   admin
+
+parameters:
+  - name: HuntDescription
+    description: Description for the hunt.
+    default: Automated hunt
+
+  - name: ArtifactName
+    description: Artifact to hunt.
+    default: Generic.Client.Info
+    # For multiple artifacts, use JSON array parameter type
+
+  - name: ArtifactParameters
+    description: JSON object with parameters for the hunted artifact.
+    type: json
+    default: "{}"
+
+  - name: HuntId
+    description: Hunt ID for querying or managing an existing hunt.
+    # Example: H.12345
+
+  - name: HuntStateFilter
+    description: Filter hunts by state (RUNNING, STOPPED, PAUSED).
+    type: regex
+    default: .
+
+  - name: ReallyDoIt
+    type: bool
+    description: Must be set to Y to actually delete hunts (dry-run otherwise).
+
+sources:
+  # =========================================================================
+  # SOURCE 1: Create and launch a hunt
+  # =========================================================================
+  - name: CreateHunt
+    query: |
+      -- hunt() creates and immediately starts a hunt across all clients
+      -- Returns hunt_id, state, create_time
+      SELECT hunt(
+        description=HuntDescription,
+        artifacts=ArtifactName,
+        -- spec maps artifact name → parameter dict
+        -- TODO: Replace artifact name and add parameters as needed
+        spec=dict(`Generic.Client.Info`=dict())
+        -- Single artifact with params:
+        --   spec=dict(`Windows.Sys.Users`=dict(UserRegex="admin.*"))
+        -- Multiple artifacts:
+        --   spec=dict(`Windows.Sys.Users`=dict(UserRegex=".*"),
+        --             `Windows.Network.NetstatEnriched`=dict())
+      ) AS Hunt
+      FROM scope()
+
+  # =========================================================================
+  # SOURCE 2: List hunts with statistics
+  # =========================================================================
+  - name: ListHunts
+    query: |
+      SELECT HuntId,
+             hunt_description AS Description,
+             timestamp(epoch=create_time) AS Created,
+             timestamp(epoch=start_time) AS Started,
+             creator AS Creator,
+             state AS State,
+             join(array=start_request.artifacts, sep=", ") AS Artifacts,
+             stats.total_clients_scheduled AS ClientsScheduled,
+             stats.total_clients_with_results AS ClientsWithResults,
+             stats.total_clients_with_errors AS ClientsWithErrors
+      FROM hunts()
+      WHERE state =~ HuntStateFilter
+      ORDER BY create_time DESC
+      -- Common filters:
+      --   WHERE state = "RUNNING"
+      --   WHERE hunt_description =~ "Daily.*"
+
+  # =========================================================================
+  # SOURCE 3: Retrieve hunt results
+  # =========================================================================
+  - name: HuntResults
+    query: |
+      -- Retrieve all collected rows from the hunt
+      -- TODO: Set artifact= to the artifact that was hunted
+      SELECT * FROM hunt_results(
+        hunt_id=HuntId,
+        artifact="Generic.Client.Info")
+        -- artifact= is required (hunt may have collected multiple)
+        -- source= can specify a named source within multi-source artifacts
+
+  # =========================================================================
+  # SOURCE 4: List per-client flows for a hunt
+  # =========================================================================
+  - name: HuntFlows
+    query: |
+      SELECT client_id AS ClientId,
+             session_id AS FlowId,
+             state AS State,
+             timestamp(epoch=create_time / 1000000) AS Created,
+             timestamp(epoch=active_time / 1000000) AS LastActive,
+             total_collected_rows AS RowsCollected,
+             total_uploaded_bytes AS BytesUploaded
+      FROM hunt_flows(hunt_id=HuntId)
+      ORDER BY state, create_time DESC
+      -- Useful filters:
+      --   WHERE state = "ERROR"          — only failed flows
+      --   WHERE total_collected_rows > 0 — only flows with results
+
+  # =========================================================================
+  # SOURCE 5: Delete hunt (dry-run by default)
+  # =========================================================================
+  # - name: DeleteHunt
+  #   query: |
+  #     -- DESTRUCTIVE: hunt_delete with really_do_it=TRUE removes all files
+  #     SELECT hunt_delete(
+  #       hunt_id=HuntId,
+  #       really_do_it=ReallyDoIt) AS Deleted
+  #     FROM scope()
+  #     WHERE ReallyDoIt
+  #       AND log(message="Deleting hunt: " + HuntId)
+
+# =============================================================================
+# SCHEDULED HUNT PATTERN (SERVER_EVENT)
+# =============================================================================
+# To schedule periodic hunts, change type to SERVER_EVENT and use:
+#
+# sources:
+#   - query: |
+#       LET schedule = SELECT timestamp(epoch=now()) AS Now
+#       FROM clock(period=60)
+#       WHERE Now.UTC.String =~ ScheduleTimeRegex + ":[0-9][0-9]"
+#         AND Now.Weekday.String =~ ScheduleDayRegex
+#         AND log(message="Launching scheduled hunt at " + Now.UTC.String)
+#
+#       SELECT hunt(
+#         description=HuntDescription,
+#         artifacts=ArtifactName,
+#         spec=dict(`Generic.Client.Info`=dict())
+#       ) AS Hunt
+#       FROM schedule
+#
+# Add these parameters:
+#   ScheduleDayRegex: "Tuesday"  (day of week, use ".*" for every day)
+#   ScheduleTimeRegex: "01:28"   (UTC HH:MM, seconds matched with :[0-9][0-9])
+# =============================================================================
+
+column_types:
+  - name: Created
+    type: timestamp
+  - name: Started
+    type: timestamp
+  - name: LastActive
+    type: timestamp

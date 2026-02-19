@@ -1,0 +1,137 @@
+# Template: macOS Binary Format Parsing
+# Platform: macos
+# Use when: Parsing custom binary file formats on macOS (FSEvents, MRU, AppleDouble, Mach-O)
+
+# =============================================================================
+# Based on: MacOS.Forensics.FSEvents, MacOS.Forensics.MRU,
+#           MacOS.Forensics.AppleDoubleZip
+#
+# Patterns demonstrated:
+#   A. parse_binary() with a custom profile (struct definition)
+#   B. switch() for format detection (multiple magic bytes / header types)
+#   C. AppleDouble/ZIP nested format with pathspec
+#
+# parse_binary() profiles define C-like structs with field types:
+#   uint8, uint16, uint32, uint64 (with _le/_be suffix for endianness)
+#   String, StringWithSize, Hex, Array
+#   Profile is passed as a JSON string defining the struct layout
+# =============================================================================
+
+name: MacOS.Forensics.ArtifactName     # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what binary format this artifact parses.
+
+  Describe: the file format being parsed, which magic bytes or headers
+  identify it, what data fields are extracted, and the forensic value.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'darwin'
+
+parameters:
+  - name: FileGlob
+    description: Glob pattern to find binary files to parse.
+    default: /.fseventsd/*
+    # TODO: Set the glob for your binary format
+
+  - name: Upload_File
+    type: bool
+    default: N
+    description: Upload raw binary files to server for further analysis.
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: parse_binary() with custom struct profile
+      -- =====================================================================
+
+      -- Define the binary structure in a profile (JSON format)
+      -- Profile maps struct names to field definitions
+      LET Profile = '''[
+        ["Header", 0, [
+          ["Magic", 0, "uint32"],
+          ["Version", 4, "uint32"],
+          ["Checksum", 8, "uint32"],
+          ["RecordCount", 12, "uint32"]
+        ]],
+        ["Record", 0, [
+          ["Offset", 0, "uint64"],
+          ["Flags", 8, "uint32"],
+          ["NameLength", 12, "uint16"],
+          ["Name", 14, "String", {"Length": "x=>x.NameLength"}]
+        ]]
+      ]'''
+      -- TODO: Define the actual struct layout for your binary format
+      -- See velociraptor binary parsing documentation for field types
+
+      SELECT * FROM foreach(
+        row={SELECT OSPath FROM glob(globs=FileGlob)},
+        query={
+          -- Read the binary file and parse the header
+          LET RawData = read_file(filename=OSPath)
+          LET Header = parse_binary(
+            filename=RawData, accessor="data",
+            profile=Profile, struct="Header")
+
+          SELECT OSPath,
+                 Header.Magic AS Magic,
+                 Header.Version AS Version,
+                 Header.RecordCount AS RecordCount,
+                 if(condition=Upload_File,
+                    then=upload(file=OSPath)) AS Upload
+          FROM scope()
+          WHERE Header.Magic = 0x1F5DFA20   -- TODO: Set your format's magic bytes
+        })
+
+      -- =====================================================================
+      -- PATTERN B: switch() for multi-format detection (SSH key style)
+      -- Use when a file could be one of several binary formats
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT OSPath FROM glob(globs=FileGlob)},
+      --   query={
+      --     LET Header = read_file(filename=OSPath, length=64)
+      --     SELECT * FROM switch(
+      --       openssh={
+      --         SELECT OSPath, "OpenSSH" AS Format
+      --         FROM scope()
+      --         WHERE Header =~ "BEGIN OPENSSH PRIVATE KEY"
+      --       },
+      --       rsa={
+      --         SELECT OSPath, "RSA" AS Format
+      --         FROM scope()
+      --         WHERE Header =~ "BEGIN RSA PRIVATE KEY"
+      --       },
+      --       default={
+      --         SELECT OSPath, "Unknown" AS Format
+      --         FROM scope()
+      --       })
+      --   })
+
+      -- =====================================================================
+      -- PATTERN C: Nested format in ZIP (AppleDouble style)
+      -- Use for ZIP/container files with embedded binary content
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT OSPath FROM glob(globs="*.zip")},
+      --   query={
+      --     SELECT * FROM foreach(
+      --       row={SELECT OSPath AS InnerPath
+      --            FROM glob(globs="/**/__MACOSX/**",
+      --              root=pathspec(DelegatePath=OSPath),
+      --              accessor="zip")},
+      --       query={
+      --         LET data = read_file(filename=InnerPath, accessor="zip")
+      --         SELECT parse_binary(
+      --           filename=data, accessor="data",
+      --           profile=Profile, struct="Header") AS Parsed
+      --         FROM scope()
+      --       })
+      --   })
+
+column_types:
+  - name: Upload
+    type: preview_upload

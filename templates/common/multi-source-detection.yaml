@@ -1,0 +1,133 @@
+# Template: Multi-Source Detection
+# Platform: common
+# Use when: Combining detection results from multiple independent sources using chain() or named sources
+
+# =============================================================================
+# Cross-platform multi-source template. Consolidates patterns from:
+#   - Windows.Sys.StartupItems (named sources for different startup locations)
+#   - MacOS.Detection.Autoruns (chain() across LaunchAgents, Daemons, Login items)
+#   - Windows.Packs.Persistence
+#
+# Core pattern (identical across platforms):
+#   Named sources (parallel) OR chain() (sequential) to combine results from
+#   multiple independent detection locations into a single result set.
+#
+# When to use named sources vs chain():
+#   Named sources: Different data shapes per location, want separate tabs in UI.
+#   chain(): Same data shape, want a single combined result set.
+#
+# Platform-specific notes:
+#   Windows: Common for combining registry keys + filesystem + WMI data.
+#   macOS:   Common for combining LaunchAgents + LaunchDaemons + Login items.
+#   Linux:   Common for combining /etc/cron + systemd + rc.d + user crontabs.
+# =============================================================================
+
+name: Platform.Category.ArtifactName   # TODO: e.g., MacOS.Detection.Autoruns
+description: |
+  TODO: One-line summary of what persistence mechanisms or data sources this artifact covers.
+
+  Describe:
+  - Which locations or sources are checked
+  - What detection logic is applied to each
+  - How results from different sources are combined
+
+type: CLIENT
+
+author: TODO Author Name - @handle
+
+precondition: |
+  SELECT OS FROM info() WHERE OS =~ 'linux'   # TODO: Set for your platform
+
+parameters:
+  # -- Filter --
+  - name: NameRegex
+    type: regex
+    default: .
+    description: Filter results by name/path (default matches all).
+
+  # -- Source selection --
+  - name: CheckSource1
+    type: bool
+    default: Y
+    description: Include results from source 1.
+    # TODO: Rename to reflect actual source (e.g., CheckLaunchAgents)
+
+  - name: CheckSource2
+    type: bool
+    default: Y
+    description: Include results from source 2.
+    # TODO: Rename to reflect actual source (e.g., CheckLaunchDaemons)
+
+sources:
+  # =========================================================================
+  # PATTERN A: Named sources (each source appears as a separate tab in the UI)
+  # Use when each source has a different data shape or represents a
+  # distinct category of findings.
+  # NOTE: Named sources run serially by default (shared scope).
+  # =========================================================================
+  - name: Source1                       # TODO: Rename (e.g., LaunchAgents)
+    query: |
+      -- Source 1 detection logic
+      -- TODO: Replace with actual detection for this location
+      SELECT OSPath,
+             "Source1" AS SourceType,
+             Mtime AS ModifiedTime,
+             NULL AS Details
+      FROM glob(globs=["/etc/cron.d/**"])   -- TODO: Set glob for your source
+      WHERE OSPath =~ NameRegex
+        AND CheckSource1                    -- Honor source enable toggle
+
+  - name: Source2                       # TODO: Rename (e.g., LaunchDaemons)
+    query: |
+      -- Source 2 detection logic
+      -- TODO: Replace with actual detection for this location
+      SELECT OSPath,
+             "Source2" AS SourceType,
+             Mtime AS ModifiedTime,
+             NULL AS Details
+      FROM glob(globs=["/var/spool/cron/**"])  -- TODO: Set glob for your source
+      WHERE OSPath =~ NameRegex
+        AND CheckSource2                    -- Honor source enable toggle
+
+  # =========================================================================
+  # PATTERN B: chain() for combined single result set
+  # Use when all sources produce the same data shape and you want one
+  # unified result set rather than separate tabs.
+  # Uncomment this source and remove Pattern A above if preferred.
+  # =========================================================================
+  # - name: Combined
+  #   query: |
+  #     SELECT * FROM chain(
+  #       source1={
+  #         SELECT OSPath, "Source1" AS SourceType, Mtime AS ModifiedTime
+  #         FROM glob(globs=["/etc/cron.d/**"])
+  #         WHERE CheckSource1
+  #       },
+  #       source2={
+  #         SELECT OSPath, "Source2" AS SourceType, Mtime AS ModifiedTime
+  #         FROM glob(globs=["/var/spool/cron/**"])
+  #         WHERE CheckSource2
+  #       })
+  #     WHERE OSPath =~ NameRegex
+
+  # =========================================================================
+  # PATTERN C: Source-level preconditions for OS-conditional sources
+  # Adding precondition: to ANY source makes ALL sources run in parallel.
+  # LET variables are NOT shared between parallel sources.
+  # Use this when different sources need different OS checks.
+  # =========================================================================
+  # - name: WindowsOnly
+  #   precondition: |
+  #     SELECT OS FROM info() WHERE OS = 'windows'
+  #   query: |
+  #     SELECT * FROM ...
+  #
+  # - name: LinuxOnly
+  #   precondition: |
+  #     SELECT OS FROM info() WHERE OS = 'linux'
+  #   query: |
+  #     SELECT * FROM ...
+
+column_types:
+  - name: ModifiedTime
+    type: timestamp

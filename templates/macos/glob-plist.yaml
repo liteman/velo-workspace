@@ -1,0 +1,110 @@
+# Template: macOS Plist Parsing
+# Platform: macos
+# Use when: Parsing Apple plist files (binary or XML format) from filesystem paths
+
+# =============================================================================
+# Based on: MacOS.System.Plist, MacOS.Detection.InstallHistory,
+#           MacOS.System.Dock, MacOS.System.Wifi
+#
+# Patterns demonstrated:
+#   A. Direct plist file parsing with key access
+#   B. Iterate over plist array values with foreach()
+#   C. Parse embedded plist data (binary blob in another plist)
+#   D. Extract username from /Users/*/path patterns
+#
+# macOS timestamp types:
+#   timestamp(epoch=)      — Unix epoch (standard)
+#   timestamp(mactime=)    — Mac absolute time (seconds since 2001-01-01)
+#   timestamp(cocoatime=)  — Cocoa float64 timestamp
+#   timestamp(winfiletime=) — Chrome and some apps use Windows FILETIME
+# =============================================================================
+
+name: MacOS.Category.ArtifactName      # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what plist data this artifact collects.
+
+  Describe: which plist files are parsed, what keys are extracted,
+  and the forensic or operational value.
+
+type: CLIENT
+author: TODO Author Name - @handle
+
+precondition: SELECT OS FROM info() WHERE OS =~ 'darwin'
+
+parameters:
+  - name: PlistGlob
+    description: Glob pattern to find plist files.
+    default: /Library/Preferences/*.plist
+    # Common plist paths:
+    #   /Library/Preferences/*.plist                    — system prefs
+    #   /Users/*/Library/Preferences/*.plist            — per-user prefs
+    #   /Library/LaunchAgents/*.plist                   — system launch agents
+    #   /Users/*/Library/LaunchAgents/*.plist           — per-user launch agents
+    #   /Library/LaunchDaemons/*.plist                  — launch daemons
+    #   /Library/Receipts/InstallHistory.plist          — install history (single file)
+    #   /Users/*/Library/Preferences/com.apple.dock.plist — Dock config
+
+  - name: NameRegex
+    type: regex
+    default: .
+    description: Filter results by filename.
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: Direct plist parsing — access specific keys
+      -- =====================================================================
+      SELECT OSPath,
+             Mtime AS ModifiedTime,
+             -- Access top-level plist keys directly:
+             plist(file=OSPath).SomeKey AS KeyValue,
+             -- Access nested keys:
+             -- plist(file=OSPath).`nested-key`.subkey AS NestedValue,
+             -- Access with backticks for keys with dashes:
+             -- plist(file=OSPath).`com.apple.some-key` AS PlistValue,
+             -- Extract username from per-user paths:
+             parse_string_with_regex(
+               regex="/Users/(?P<User>[^/]+)",
+               string=OSPath).User AS Username
+      FROM glob(globs=PlistGlob)
+      WHERE OSPath =~ NameRegex
+
+      -- =====================================================================
+      -- PATTERN B: Iterate over a plist array
+      -- Use for plists that contain a list (e.g., InstallHistory, dock items)
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT OSPath FROM glob(globs=PlistGlob)},
+      --   query={
+      --     -- plist() returns the parsed data; iterate array with foreach
+      --     SELECT * FROM foreach(
+      --       row=plist(file=OSPath).ArrayKeyName,   -- TODO: Set the array key
+      --       query={
+      --         SELECT OSPath,
+      --                _value.name AS Name,          -- TODO: Set field names
+      --                _value.version AS Version,
+      --                timestamp(mactime=_value.date) AS InstallDate
+      --         FROM scope()
+      --       })
+      --   })
+
+      -- =====================================================================
+      -- PATTERN C: Parse embedded binary plist from a key value
+      -- Use for plists that contain another plist as a binary data blob
+      -- Uncomment and replace Pattern A:
+      -- =====================================================================
+      -- SELECT OSPath, plist(
+      --   file=read_file(filename=OSPath),
+      --   accessor="data") AS ParsedPlist
+      -- FROM foreach(
+      --   row={SELECT OSPath FROM glob(globs=PlistGlob)},
+      --   query={
+      --     SELECT OSPath,
+      --            plist(file=some_binary_field, accessor="data") AS EmbeddedPlist
+      --     FROM scope()
+      --   })
+
+column_types:
+  - name: ModifiedTime
+    type: timestamp

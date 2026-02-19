@@ -1,0 +1,213 @@
+# Template: Server Label-Based Client Automation
+# Platform: server
+# Use when: Automating actions on labeled clients (notify, collect, triage workflows)
+
+# =============================================================================
+# Based on: Server.Slack.Clients.Online, label() usage patterns
+#
+# Patterns demonstrated:
+#   - type: SERVER_EVENT with clock(period=) for periodic label polling
+#   - clients(search="label:X") for labeled client search
+#   - label(client_id=, labels=, op="set"/"remove") for label management
+#   - Webhook notification via http_client() for labeled client events
+#   - collect_client() for auto-collection on labeled clients
+#   - watch_monitoring("Server.Internal.Label") for real-time label events
+#   - timestamp(epoch=last_seen_at / 1000000) conversion
+#
+# Label-as-queue pattern:
+#   1. Admin adds label (e.g., "CollectNow") via GUI or API
+#   2. This artifact detects the labeled client within Period seconds
+#   3. Artifact performs action (collect, notify, escalate)
+#   4. Artifact removes label: op="remove" (prevents duplicate processing)
+#   5. Cycle repeats for next labeled client
+#
+# Polling vs Real-time:
+#   Polling:   clock() + clients(search="label:X") — simpler, has delay
+#   Real-time: watch_monitoring("Server.Internal.Label") — immediate
+# =============================================================================
+
+name: Server.Automation.ArtifactName  # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what label-based automation this artifact performs.
+
+  Describe: which label is monitored, what action is taken when a client is
+  labeled, and whether the label is removed after processing.
+
+  ## Label-as-Queue Pattern
+
+  1. Administrator adds label "LabelGroup" to a client via the GUI
+  2. This artifact detects the labeled client within Period seconds
+  3. The configured action is performed (notify, collect, escalate)
+  4. The label is removed to prevent duplicate processing
+
+  ## Configuration
+
+  Store the webhook URL in Server Metadata under key `SlackToken`.
+
+type: SERVER_EVENT                     # Required for continuous monitoring
+author: TODO Author Name - @handle
+
+parameters:
+  - name: LabelGroup
+    description: Label name to monitor. Clients with this label will be processed.
+    default: "Slack"
+    # TODO: Set to the label name used in your workflow
+
+  - name: Period
+    description: Poll interval in seconds.
+    type: int
+    default: "60"
+
+  - name: SlackToken
+    description: Slack/Teams/Discord webhook URL. Leave blank to use server_metadata().SlackToken.
+
+  - name: DisableSSLVerify
+    type: bool
+    description: Disable SSL verification for webhook requests.
+    default: N
+
+  - name: RemoveLabelAfterProcessing
+    type: bool
+    description: Remove the label after processing to prevent duplicate actions.
+    default: Y
+
+sources:
+  - query: |
+      -- Retrieve webhook URL from parameter or server_metadata()
+      LET token_url <= if(condition=SlackToken,
+          then=SlackToken,
+          else=server_metadata().SlackToken)
+
+      -- =====================================================================
+      -- PATTERN 1: Periodic label polling with webhook notification
+      -- =====================================================================
+      SELECT * FROM foreach(
+        row={SELECT * FROM clock(period=Period)},
+        query={
+          LET labeled_clients = SELECT
+              client_id,
+              os_info.fqdn AS FQDN,
+              os_info.system AS OS,
+              last_ip AS LastIP,
+              timestamp(epoch=last_seen_at / 1000000) AS LastSeen
+            FROM clients(search="label:" + LabelGroup)
+
+          SELECT * FROM foreach(
+            row=labeled_clients,
+            query={
+              -- Send webhook notification (if URL is configured)
+              LET notification = if(condition=token_url,
+                then={
+                  SELECT * FROM http_client(
+                    url=token_url,
+                    method="POST",
+                    headers=dict(`Content-Type`="application/json"),
+                    data=serialize(item=dict(
+                      text=format(format="Client online: %v (%v) | IP: %v | Last seen: %v",
+                                  args=[FQDN, OS, LastIP, LastSeen])),
+                      format="json"),
+                    disable_ssl_security=DisableSSLVerify)
+                },
+                else={SELECT NULL FROM scope()})
+
+              -- Remove label after processing (label-as-queue)
+              LET remove_label = if(condition=RemoveLabelAfterProcessing,
+                then=label(client_id=client_id, labels=LabelGroup, op="remove"),
+                else=NULL)
+
+              SELECT client_id, FQDN, OS, LastIP, LastSeen,
+                     notification, remove_label
+              FROM scope()
+              WHERE log(message=format(format="Processed labeled client: %v", args=[FQDN]))
+            })
+        })
+
+      -- =====================================================================
+      -- PATTERN 2: Auto-collect from labeled clients
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT * FROM clock(period=Period)},
+      --   query={
+      --     LET labeled_clients = SELECT client_id,
+      --         client_info(client_id=client_id).os_info.fqdn AS FQDN
+      --       FROM clients(search="label:" + LabelGroup)
+      --
+      --     SELECT * FROM foreach(
+      --       row=labeled_clients,
+      --       query={
+      --         LET collection = collect_client(
+      --           client_id=client_id,
+      --           artifacts=[ArtifactName],
+      --           env=dict())
+      --
+      --         LET _ <= if(condition=RemoveLabelAfterProcessing,
+      --           then=label(client_id=client_id, labels=LabelGroup, op="remove"),
+      --           else=NULL)
+      --
+      --         SELECT client_id, FQDN, collection.flow_id AS FlowId
+      --         FROM scope()
+      --         WHERE log(message=format(format="Scheduled collection on %v: %v",
+      --                                  args=[FQDN, collection.flow_id]))
+      --       })
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 3: Real-time label event monitoring
+      -- React immediately when a label is added, no polling delay.
+      -- Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={
+      --     -- Watch for label add events on the target label
+      --     SELECT * FROM watch_monitoring(artifact="Server.Internal.Label")
+      --     WHERE Operation = "set" AND Label = LabelGroup
+      --   },
+      --   query={
+      --     LET info <= client_info(client_id=ClientId)
+      --
+      --     LET notification = if(condition=token_url,
+      --       then={
+      --         SELECT * FROM http_client(
+      --           url=token_url,
+      --           method="POST",
+      --           headers=dict(`Content-Type`="application/json"),
+      --           data=serialize(item=dict(
+      --             text=format(format="Label '%v' added to %v",
+      --                         args=[Label, info.os_info.fqdn])),
+      --             format="json"),
+      --           disable_ssl_security=DisableSSLVerify)
+      --       }, else={SELECT NULL FROM scope()})
+      --
+      --     LET _ <= if(condition=RemoveLabelAfterProcessing,
+      --       then=label(client_id=ClientId, labels=Label, op="remove"),
+      --       else=NULL)
+      --
+      --     SELECT ClientId, info.os_info.fqdn AS FQDN, Label, notification
+      --     FROM scope()
+      --   })
+
+      -- =====================================================================
+      -- PATTERN 4: Add labels based on criteria (proactive labeling)
+      -- Automatically label stale clients. Uncomment and replace Pattern 1:
+      -- =====================================================================
+      -- SELECT * FROM foreach(
+      --   row={SELECT * FROM clock(period=Period)},
+      --   query={
+      --     LET stale_clients = SELECT client_id,
+      --         os_info.fqdn AS FQDN,
+      --         (now() - last_seen_at / 1000000) / 86400 AS DaysSinceLastSeen
+      --       FROM clients(search="all")
+      --       WHERE DaysSinceLastSeen > 7
+      --         AND NOT labels =~ "Stale"   -- Only label if not already labeled
+      --
+      --     SELECT FQDN, DaysSinceLastSeen,
+      --       label(client_id=client_id, labels="Stale", op="set") AS LabelResult
+      --     FROM stale_clients
+      --     WHERE log(message=format(format="Labeled stale client: %v (%v days)",
+      --                              args=[FQDN, DaysSinceLastSeen]))
+      --   })
+
+column_types:
+  - name: LastSeen
+    type: timestamp

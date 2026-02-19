@@ -1,0 +1,138 @@
+# Template: System Command Execution
+# Platform: common
+# Use when: Running an external command or tool and parsing its output (JSON, CSV, text lines)
+
+# =============================================================================
+# Cross-platform command execution template. Consolidates patterns from:
+#   - Windows.Sysinternals.Autoruns (CSV + UTF-16 output)
+#   - Windows.OSQuery.Generic (JSON output)
+#   - Linux.Sys.Services (text output with Grok)
+#   - MacOS.System.Packages (JSON from system_profiler)
+#
+# Core pattern (identical across platforms):
+#   FetchBinary (if external tool) → execve() → parse output
+#
+# Output parsing patterns:
+#   A. JSON array: parse_json_array(data=Stdout)
+#   B. CSV text:   parse_csv(filename=Stdout, accessor="data")
+#   C. Line-by-line: parse_lines(filename=Stdout, accessor="data")
+#   D. Grok pattern: grok(grok=Pattern, data=Line)
+#
+# Platform-specific notes:
+#   Windows: Many tools output UTF-16; use utf16(string=Stdout) before parsing.
+#            Use architecture-dependent tool selection (Autorun_amd64, etc.)
+#   macOS:   system_profiler outputs JSON with -json flag.
+#            Some commands may need launchctl or sudo.
+#   Linux:   Use execve() length=10000000 for package lists.
+#            Consider switch() for distro-agnostic commands (dnf vs yum).
+# =============================================================================
+
+name: Platform.Category.ArtifactName   # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what this artifact collects via command execution.
+
+  Describe:
+  - The external command or tool being invoked
+  - What data it returns and how it is parsed
+  - Any prerequisites (tool must be present, permissions needed)
+
+type: CLIENT
+
+author: TODO Author Name - @handle
+
+precondition: |
+  SELECT OS FROM info() WHERE OS =~ 'linux'   # TODO: Set for your platform
+
+# Use implied_permissions for safe read-only commands:
+implied_permissions:
+  - EXECVE
+
+# Use required_permissions for dangerous/modifying commands:
+# required_permissions:
+#   - EXECVE
+
+# Declare external tool binary (if not using a system command):
+# tools:
+#   - name: ToolNameLinux
+#     github_project: Velocidex/OSQuery-Releases
+#     github_asset_regex: linux-amd64
+
+parameters:
+  # -- Output size limit (bytes) for execve --
+  - name: Length
+    type: int
+    default: "10000000"
+    description: Maximum output size in bytes. Default 10MB.
+
+  # -- Query/command parameter --
+  - name: Query
+    default: "SELECT * FROM osquery_info"
+    description: The query or argument to pass to the tool.
+    # TODO: Set meaningful default or remove if command is fixed
+
+sources:
+  - query: |
+      -- =====================================================================
+      -- PATTERN A: External tool with JSON output (OSQuery style)
+      -- =====================================================================
+      LET binary <= SELECT OSPath
+        FROM Artifact.Generic.Utils.FetchBinary(ToolName="ToolNameLinux")
+        -- TODO: Replace ToolName with your tool name (must match tools: section)
+
+      LET result = SELECT * FROM execve(
+        argv=[binary[0].OSPath, "--json", Query],
+        -- TODO: Replace with your tool's command-line arguments
+        length=Length)
+
+      SELECT * FROM foreach(row=result,
+        query={SELECT * FROM parse_json_array(data=Stdout)})
+
+      -- =====================================================================
+      -- PATTERN B: System command with line-by-line text output
+      -- Uncomment and replace Pattern A above.
+      -- =====================================================================
+      -- LET output <= SELECT * FROM execve(
+      --   argv=["systemctl", "list-units", "--type=service"],
+      --   length=Length)
+      --
+      -- SELECT * FROM parse_lines(filename=output[0].Stdout, accessor="data")
+      -- WHERE Line =~ ".service$"
+
+      -- =====================================================================
+      -- PATTERN C: System command with CSV output
+      -- Uncomment and replace Pattern A above.
+      -- =====================================================================
+      -- LET output = SELECT * FROM execve(
+      --   argv=["some-tool", "--csv"],
+      --   length=Length)
+      --
+      -- SELECT * FROM foreach(row=output,
+      --   query={SELECT * FROM parse_csv(filename=Stdout, accessor="data")})
+
+      -- =====================================================================
+      -- PATTERN D: Distro-agnostic command with switch() fallback
+      -- (Linux: try multiple package managers in order)
+      -- Uncomment and replace Pattern A above.
+      -- =====================================================================
+      -- SELECT * FROM switch(
+      --   dnf={SELECT * FROM execve(argv=["dnf", "list", "installed"], length=Length)
+      --        WHERE Stdout},
+      --   yum={SELECT * FROM execve(argv=["yum", "list", "installed"], length=Length)
+      --        WHERE Stdout},
+      --   default={SELECT "No supported package manager found" AS Error FROM scope()})
+
+      -- =====================================================================
+      -- PATTERN E: Windows tool with UTF-16 CSV output (Sysinternals style)
+      -- Uncomment and replace Pattern A above.
+      -- =====================================================================
+      -- LET os_info <= SELECT Architecture FROM info()
+      -- LET bin <= SELECT * FROM Artifact.Generic.Utils.FetchBinary(
+      --   ToolName="Autorun_" + os_info[0].Architecture)
+      --
+      -- LET output = SELECT * FROM execve(
+      --   argv=[bin[0].OSPath, "-nobanner", "-accepteula", "-c"],
+      --   length=Length)
+      --
+      -- SELECT * FROM foreach(row=output,
+      --   query={SELECT * FROM parse_csv(
+      --     filename=utf16(string=Stdout), accessor="data")})

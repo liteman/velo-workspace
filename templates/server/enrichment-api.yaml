@@ -1,0 +1,194 @@
+# Template: Server API Enrichment
+# Platform: server
+# Use when: Calling external APIs for threat intel enrichment (VirusTotal, GeoIP, etc.)
+
+# =============================================================================
+# Based on: Server.Enrichment.Virustotal, Server.Enrichment.GeoIP
+#
+# Patterns demonstrated:
+#   - type: SERVER for on-demand lookups
+#   - server_metadata() credential retrieval with parameter fallback
+#   - http_client() GET/POST for API calls
+#   - parse_json() / parse_json_array() for response parsing
+#   - export block with reusable LookupHash / LookupIP functions
+#   - format() for URL construction
+#   - disable_ssl_security for self-signed certs
+#   - Multi-step API workflow (list analyzers → submit → retrieve report)
+#   - Local database lookup (GeoIP-style mmdb)
+#
+# Credential management pattern:
+#   Store in server_metadata() via GUI: Server Artifacts → Server Metadata
+#   Parameter provides override for testing / per-call use
+#   Always materialize with <= to avoid repeated metadata() calls
+#
+# Export block:
+#   Allows other artifacts to import and call LookupHash() / LookupIP()
+#   without duplicating credential retrieval logic
+# =============================================================================
+
+name: Server.Enrichment.ArtifactName  # TODO: Set artifact name
+description: |
+  TODO: One-line summary of what external API this artifact queries.
+
+  Describe: what data is looked up (hashes, IPs, domains), how to configure
+  credentials, and what fields are returned.
+
+  ## Configuration
+
+  Store credentials in Server Metadata (Server Artifacts → Server Metadata):
+  - Key: `YourServiceAPIKey`
+  - Value: Your API key
+
+  Alternatively, provide ApiKey as a parameter for direct use.
+
+  ## Export Functions
+
+  - `LookupHash(Hash)` — look up file hash
+  - `LookupIP(IP)` — look up IP reputation
+
+type: SERVER
+author: TODO Author Name - @handle
+
+parameters:
+  - name: Hash
+    description: File hash (MD5/SHA256) to look up.
+    default: "44d88612fea8a8f36de82e1278abb02f"
+
+  - name: IP
+    description: IP address to look up.
+    # default: "8.8.8.8"
+
+  - name: ApiKey
+    description: API key. Leave blank to use server_metadata().YourServiceAPIKey.
+
+  - name: ApiURL
+    description: Base URL for the API endpoint.
+    default: "https://api.example.com/v3"
+    # TODO: Set to your API's base URL
+
+  - name: DisableSSLVerify
+    type: bool
+    description: Disable SSL certificate verification (for self-signed certs).
+    default: N
+
+# Export block: reusable lookup functions for other artifacts to import
+export: |
+  -- Materialize credentials once (avoid repeated server_metadata() calls)
+  LET _ApiKey <= if(condition=ApiKey,
+      then=ApiKey,
+      else=server_metadata().YourServiceAPIKey)
+
+  -- Hash lookup function (VirusTotal-style GET with API key header)
+  LET LookupHash(Hash) = SELECT
+      parse_json(data=Content) AS Response,
+      get(item=parse_json(data=Content),
+          field="data.attributes.last_analysis_stats.malicious",
+          default=0) AS MaliciousCount,
+      get(item=parse_json(data=Content),
+          field="data.attributes.last_analysis_stats.suspicious",
+          default=0) AS SuspiciousCount
+    FROM http_client(
+      url=format(format="%v/files/%v", args=[ApiURL, Hash]),
+      method="GET",
+      headers=dict(`x-apikey`=_ApiKey),
+      disable_ssl_security=DisableSSLVerify)
+
+  -- IP lookup function (simple GET)
+  LET LookupIP(IP) = SELECT
+      parse_json(data=Content) AS Response,
+      get(item=parse_json(data=Content), field="country_code") AS CountryCode,
+      get(item=parse_json(data=Content), field="reputation") AS Reputation
+    FROM http_client(
+      url=format(format="%v/ips/%v", args=[ApiURL, IP]),
+      method="GET",
+      headers=dict(`x-apikey`=_ApiKey),
+      disable_ssl_security=DisableSSLVerify)
+
+  -- TODO: Add more lookup functions for domains, URLs, etc.
+
+sources:
+  - query: |
+      -- Retrieve credentials with fallback to server_metadata()
+      LET Creds <= if(condition=ApiKey,
+          then=ApiKey,
+          else=server_metadata().YourServiceAPIKey)
+
+      -- Validate credentials exist before calling API
+      LET _ <= if(condition=NOT Creds,
+          then=log(message="API key not configured in server_metadata().YourServiceAPIKey"),
+          else=TRUE)
+
+      -- =====================================================================
+      -- PATTERN 1: Simple GET with API key header (VirusTotal-style)
+      -- =====================================================================
+      LET hash_lookup = SELECT
+          Hash,
+          parse_json(data=Content) AS Response,
+          Response.data.attributes.last_analysis_stats AS Stats
+        FROM http_client(
+          url=format(format="%v/files/%v", args=[ApiURL, Hash]),
+          method="GET",
+          headers=dict(`x-apikey`=Creds),
+          disable_ssl_security=DisableSSLVerify)
+        WHERE Creds   -- Only call API if credentials are configured
+
+      -- =====================================================================
+      -- PATTERN 2: POST with JSON body (Hybrid Analysis-style)
+      -- Uncomment and replace Pattern 1 if your API uses POST:
+      -- =====================================================================
+      -- LET post_lookup = SELECT parse_json(data=Content) AS Response
+      --   FROM http_client(
+      --     url=format(format="%v/search/hash", args=[ApiURL]),
+      --     method="POST",
+      --     headers=dict(
+      --       `Content-Type`="application/json",
+      --       `api-key`=Creds,
+      --       `user-agent`="Velociraptor"),
+      --     data=serialize(item=dict(hash=Hash), format="json"),
+      --     disable_ssl_security=DisableSSLVerify)
+
+      -- =====================================================================
+      -- PATTERN 3: Multi-step API workflow (list → submit → poll → report)
+      -- Uncomment and replace Pattern 1 for Cortex-style analyzers:
+      -- =====================================================================
+      -- LET analyzers <= SELECT * FROM foreach(
+      --   row={
+      --     SELECT parse_json_array(data=Content) AS List
+      --     FROM http_client(url=format(format="%v/analyzer", args=[ApiURL]),
+      --       headers=dict(`Authorization`=format(format="Bearer %v", args=[Creds])))
+      --   },
+      --   query={SELECT * FROM foreach(row=List) WHERE dataTypeList =~ "hash"})
+      --
+      -- LET job_id <= SELECT get(item=parse_json(data=Content), field="id") AS JobID
+      --   FROM http_client(url=format(format="%v/analyzer/%v/run",
+      --                              args=[ApiURL, analyzers[0].id]),
+      --     method="POST",
+      --     headers=dict(`Content-Type`="application/json",
+      --                  `Authorization`=format(format="Bearer %v", args=[Creds])),
+      --     data=serialize(item=dict(data=Hash, dataType="hash"), format="json"))
+      --
+      -- LET _ <= SELECT * FROM sleep(time=5)
+      --
+      -- LET report <= SELECT parse_json(data=Content) AS Report
+      --   FROM http_client(url=format(format="%v/job/%v/report",
+      --                              args=[ApiURL, job_id[0].JobID]),
+      --     headers=dict(`Authorization`=format(format="Bearer %v", args=[Creds])))
+
+      -- =====================================================================
+      -- PATTERN 4: Local database lookup (GeoIP mmdb-style)
+      -- Uncomment and replace Pattern 1 for offline database enrichment:
+      -- =====================================================================
+      -- LET db_path <= if(condition=DatabasePath,
+      --     then=DatabasePath,
+      --     else=server_metadata().GeoIPDB)
+      --
+      -- SELECT IP,
+      --        geoip(db=db_path, ip=IP).country.names.en AS Country,
+      --        geoip(db=db_path, ip=IP).city.names.en AS City,
+      --        geoip(db=db_path, ip=IP).location.latitude AS Latitude,
+      --        geoip(db=db_path, ip=IP).location.longitude AS Longitude
+      -- FROM scope()
+      -- WHERE db_path
+
+      SELECT * FROM hash_lookup
+      -- TODO: Replace with the lookup pattern appropriate for your API
