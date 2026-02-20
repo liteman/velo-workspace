@@ -24,9 +24,9 @@ STATUS_SERVER=""
 
 # 1. Binary present + version
 if [[ -f "$BINARY" ]]; then
-    VER="$("$BINARY" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo '')"
+    VER="$("$BINARY" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo '')"
     if [[ -n "$VER" ]]; then
-        STATUS_BINARY="✓ Velociraptor $VER"
+        STATUS_BINARY="✓ Velociraptor v$VER"
     else
         STATUS_BINARY="✗ Binary present but not executable"
     fi
