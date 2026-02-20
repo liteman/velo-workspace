@@ -1,5 +1,7 @@
 # /push — Deploy artifact to server
 
+**API helper:** Use `scripts/velo_api.py` for all pyvelociraptor operations. Import functions rather than writing inline gRPC boilerplate. See function signatures in the module docstring.
+
 Deploy the current or specified artifact to a Velociraptor server. Makes the artifact available for analysts to run hunts and collections. Does NOT schedule any hunts.
 
 ## Arguments

@@ -40,12 +40,15 @@ Check whether `config/server.config.yaml` exists:
 **If it does not exist**: Generate it now using the Velociraptor binary:
 
 ```bash
-bin/velociraptor config generate > config/server.config.yaml
+bin/velociraptor config generate \
+  --merge '{"Frontend":{"initial_server_artifacts":["Server.Import.Extras"]}}' \
+  > config/server.config.yaml
 ```
 
 Then inform the user:
 - A new server config has been generated with Velociraptor defaults
 - The GUI will be available at `https://localhost:8889` when the server is started (or whatever URL appears in the generated config — check `GUI.bind_address` / `GUI.bind_port`)
+- On first server start, the artifact exchange and community extras (Sigma rules, SQLiteHunter, Registry Hunter, Rapid7 Labs, Triage artifacts) will be imported automatically via `Server.Import.Extras`. This runs once — subsequent restarts skip the import.
 - Guided configuration (custom ports, TLS certs, etc.) is available if they ask — do not prompt for choices on first setup
 
 **Do not ask the user any questions during this step** unless `config generate` fails.
@@ -86,6 +89,21 @@ Ask: "Are you working solo on this workspace, or sharing it with a team? (This a
 
 Write `config/workspace.yaml` with both values after collecting answers. If the file already exists, update only those two keys.
 
+**3. macOS Full Disk Access advisory (macOS only)**
+
+If the detected platform is macOS, display:
+
+> **macOS permissions note:** To collect artifacts from protected locations (browser
+> history, Mail, Messages, etc.) with `/test local`, your terminal needs Full Disk Access.
+>
+> 1. Open **System Settings > Privacy & Security > Full Disk Access**
+> 2. Toggle **on** your terminal app (e.g., Terminal, iTerm2, Warp, VS Code, Cursor)
+>
+> Without this, local artifact tests may return empty results for TCC-protected paths.
+> You can do this now or later — `/test local` will remind you if results look empty.
+
+Do not block on this — it is informational. Proceed to the next-steps message regardless of whether the user acknowledges.
+
 **Then suggest next steps**:
 
 > Setup complete. Run `/new` to create your first artifact, or describe what you want to collect and I'll help you get started.
@@ -104,3 +122,36 @@ Write `config/workspace.yaml` with both values after collecting answers. If the 
 ## Idempotency
 
 Every step checks before acting. Re-running `/setup` on a healthy workspace prints `[OK]` for every check and writes nothing new.
+
+---
+
+## Server Reset
+
+Use this procedure when the server state is corrupted, you need to change server configuration fundamentally, or you want a clean slate. This destroys all server state (hunts, collected data, enrolled clients).
+
+### Procedure
+
+1. **Stop the server** if running (kill the `velociraptor gui` process)
+
+2. **Remove the client service** — instruct the user:
+   ```
+   sudo scripts/remove-service.sh
+   ```
+   This uninstalls the launchd/systemd service, removes the installed binary and config, and cleans up the writeback file.
+
+3. **Delete the datastore** — confirm with the user first, as this destroys all server state (hunts, collected data, client enrollments):
+   ```bash
+   rm -rf /var/tmp/velociraptor/
+   ```
+
+4. **Delete configs** — remove generated config files so `/setup` regenerates them:
+   ```bash
+   rm -f config/server.config.yaml config/client.config.yaml config/api.config.yaml
+   ```
+
+5. **Re-run `/setup`** — this regenerates configs with `initial_server_artifacts` injected for automatic exchange import on first boot.
+
+6. **After first server boot**, wait for the artifact exchange import to complete (watch server logs for `Server.Import.Extras` completion), then re-enroll the client:
+   ```
+   sudo scripts/install-service.sh
+   ```

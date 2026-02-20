@@ -162,10 +162,18 @@ phase_finalize() {
         info "Extracting API client config from server config..."
         "$binary" --config "$server_config" config api_client \
             --name workspace-client \
-            --role analyst \
+            --role api \
             "$api_config" \
             || fail "Failed to extract API config. Verify server config is valid."
         success "API config created: $api_config"
+
+        # Set least-privilege ACL — only what the workspace workflow needs.
+        # See SECURITY.md for rationale and how to upgrade (e.g., add execve).
+        info "Setting workspace API permissions (least-privilege)..."
+        "$binary" --config "$server_config" acl grant workspace-client \
+            '{"read_results":true,"artifact_writer":true,"server_artifact_writer":true,"start_hunt":true}' \
+            || warn "Failed to set ACL. Permissions may need manual configuration."
+        success "API permissions set (no execve — see SECURITY.md to upgrade)"
     fi
 
     # Custom artifact directories

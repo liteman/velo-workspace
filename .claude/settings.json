@@ -15,7 +15,12 @@
       "Bash(git log:*)",
       "Bash(git show:*)",
       "Bash(git branch:*)",
-      "Bash(git remote:*)"
+      "Bash(git remote:*)",
+      "Bash(bin/velociraptor:*)",
+      "Bash(bash scripts/:*)",
+      "Bash(python3 scripts/:*)",
+      "Bash(mkdir -p custom/:*)",
+      "Bash(wc:*)"
     ],
     "deny": [
       "Bash(rm -rf:*)",

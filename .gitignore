@@ -1,6 +1,8 @@
 bin/
 config/
 venv/
+# Remove this line if you want to version-control your artifacts in this workspace
+custom/
 *.pyc
 __pycache__/
 .claude/settings.local.json
