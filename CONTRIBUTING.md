@@ -5,7 +5,7 @@ Thanks for your interest in improving the workspace. Contributions fall into a f
 ## Getting Started
 
 ```
-git clone <repo-url> && cd velo-workspace
+git clone https://github.com/liteman/velo-workspace.git && cd velo-workspace
 claude
 /setup
 ```

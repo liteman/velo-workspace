@@ -7,7 +7,7 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) workspace for DF
 ## Quick Start
 
 ```
-git clone <repo-url> && cd velo-workspace
+git clone https://github.com/liteman/velo-workspace.git && cd velo-workspace
 claude
 /setup
 ```
