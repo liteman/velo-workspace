@@ -91,7 +91,7 @@ phase_prereqs() {
 
     if [[ -f "$binary" ]] && "$binary" version &>/dev/null; then
         local installed_ver
-        installed_ver="$("$binary" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
+        installed_ver="$("$binary" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
         success "Velociraptor binary found: $installed_ver"
     else
         info "Fetching latest stable Velociraptor release tag..."
@@ -110,11 +110,19 @@ phase_prereqs() {
 
         [[ -n "$latest_tag" ]] || fail "Could not determine latest stable release tag."
 
-        # Tag format: v0.73.2 or v0.73.2-2 (patch suffix)
-        # Version in filename uses same tag without leading 'v' prefix in some releases
-        # Asset naming: velociraptor-v{X.Y.Z}-{os}-{arch}
-        local version="${latest_tag}"   # keep the v prefix; asset names include it
-        local asset_name="velociraptor-${version}-${VL_OS}-${VL_ARCH}"
+        # Release tags (e.g. v0.75) don't match asset filenames (e.g. v0.75.3).
+        # Each release bundles multiple patch builds; pick the highest one.
+        local asset_suffix="${VL_OS}-${VL_ARCH}"
+        local asset_name
+        asset_name="$(curl -fsSL "$api_url/tags/${latest_tag}" \
+            | grep '"name"' \
+            | grep -o "velociraptor-v[0-9.]*-${asset_suffix}" \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -1)" \
+            || fail "Failed to find a matching asset for ${asset_suffix} in release ${latest_tag}."
+
+        [[ -n "$asset_name" ]] || fail "No asset matching *-${asset_suffix} found in release ${latest_tag}."
+
         local download_url="https://github.com/Velocidex/velociraptor/releases/download/${latest_tag}/${asset_name}"
 
         info "Downloading $asset_name..."
@@ -133,7 +141,7 @@ Please verify the download at https://docs.velociraptor.app/downloads/ and repla
         fi
 
         local installed_ver
-        installed_ver="$("$binary" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
+        installed_ver="$("$binary" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
         success "Velociraptor $installed_ver downloaded and verified"
     fi
 
@@ -193,7 +201,7 @@ phase_finalize() {
     local binary_path="$BIN_DIR/velociraptor"
     if [[ -f "$binary_path" ]] && "$binary_path" version &>/dev/null; then
         local ver
-        ver="$("$binary_path" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
+        ver="$("$binary_path" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
         echo "  ✓ Velociraptor binary: $ver"
     else
         echo "  ✗ Velociraptor binary: missing or non-functional"

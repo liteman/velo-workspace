@@ -20,7 +20,8 @@
       "Bash(bash scripts/:*)",
       "Bash(python3 scripts/:*)",
       "Bash(mkdir -p custom/:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Write(config/.session-state)"
     ],
     "deny": [
       "Bash(rm -rf:*)",

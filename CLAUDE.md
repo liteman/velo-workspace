@@ -14,6 +14,7 @@ A Claude Code workspace for DFIR analysts to author, validate, test, and deploy 
 | `/test` | Execute artifact (local CLI, local server, or fleet) |
 | `/push` | Deploy artifact to Velociraptor server |
 | `/next` | Switch to a different artifact |
+| `/reset-workspace` | Reset workspace to post-clone default |
 
 ---
 
@@ -71,3 +72,5 @@ Use `/test` to run any tier. Claude selects the right one based on artifact type
 **Server lifecycle**: Claude will not start the local Velociraptor server without confirming first, unless `auto_start: true` is set in `config/workspace.yaml`. Configure this preference during `/setup` or edit the file directly.
 
 **Active artifact tracking**: Claude tracks the current artifact in `config/.session-state`. Use `/next` to switch artifacts cleanly — this clears the active artifact and platform overlay so the next session starts fresh.
+
+**Relative paths**: When slash commands specify relative paths (e.g., `bash scripts/setup.sh`, `bin/velociraptor`), use them exactly as written. Do not convert to absolute paths — the permission allow-list matches on command prefixes, and absolute paths will fail to match.

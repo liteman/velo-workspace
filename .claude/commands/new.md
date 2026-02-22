@@ -9,6 +9,8 @@ Create a new Velociraptor artifact from scratch. Claude gathers intent, selects 
 - `/new windows registry persistence`
 - `/new linux ssh brute force detection`
 - `/new macos launch agent enumeration`
+- `/new server monitor client enrollments`
+- `/new server automate hunt scheduling`
 
 ---
 
@@ -34,22 +36,55 @@ Hints pre-populate later questions but can be overridden. If no hints, all field
 
 Ask the following in a single natural prompt (not a form). Adapt based on hints already provided.
 
-**Platform**: Windows / macOS / Linux / Server / Generic
+#### 3a — Gate question: Client or Server?
 
-If a hint was provided, confirm rather than asking again:
+If no hints were provided, ask the gate question first:
+> "Are you building a **client artifact** (runs on endpoints to collect/detect) or a **server artifact** (runs on the Velociraptor server for monitoring, automation, or orchestration)?"
+
+If hints already indicate a platform (Windows, macOS, Linux → client; Server → server), skip this and confirm:
 > "You mentioned Windows — is that right, or a different platform?"
 
-If no hint: ask the user to pick a platform.
+If Generic: ask whether it's endpoint-generic (runs on all client OSes) or server-side.
+
+#### 3b — Client artifact path
+
+If building a client artifact:
+
+**Platform**: Windows / macOS / Linux / Generic
+
+If not yet determined, ask the user to pick a platform.
 
 **Description**: What does this artifact collect or detect?
 
-Ask for a plain-language description of the goal. This becomes the artifact's `description` field and drives VQL generation. Example prompts:
-- "What do you want this artifact to collect or detect?"
+Ask for a plain-language description using endpoint-relevant prompts:
+- "What do you want to collect or detect on the endpoint?"
 - "What forensic question should this artifact answer?"
+- "What attacker technique or indicator are you looking for?"
 
 **Category**: Which category fits best?
 
 Based on the platform, propose the most likely category from the platform's category list (see platform overlay guides). Show top 3 options based on the description hints, plus "other". If the user picks "other", list all valid categories for the platform.
+
+#### 3c — Server artifact path
+
+If building a server artifact:
+
+**Description**: What should this server artifact do?
+
+Ask for a plain-language description using server-relevant prompts:
+- "What server-side task should this artifact handle?"
+- "What do you want to monitor, automate, or orchestrate?"
+
+Offer examples to help the user frame their goal:
+- Monitor client enrollments or label changes
+- Schedule or manage hunts automatically
+- Track GUI user activity or audit server access
+- Run server-side queries against the datastore
+- Automate a response workflow (e.g., quarantine on detection)
+
+**Category**: Which category fits best?
+
+Propose the most likely category from the server category list (see `server.md` overlay). Show top 3 options based on the description, plus "other".
 
 ### Step 4 — Name the artifact
 
@@ -163,6 +198,6 @@ Show:
 
 **User provides full description upfront**: If the user types `/new collect all registry run keys on windows for persistence analysis`, skip asking for things already answered — platform=Windows, description is clear. Still ask for category confirmation and name.
 
-**Server artifacts**: If platform=Server, load `server.md` overlay. Server artifacts run on the server, not endpoints — note this when presenting the artifact.
+**Server artifacts**: If platform=Server, follow the 3c path (server-relevant questions). Load `server.md` overlay. Server artifacts run on the Velociraptor server, not endpoints — note this when presenting the artifact. The platform mismatch warning (Step 6) does not apply to server artifacts.
 
 **No templates match**: Proceed with a minimal scaffold (name, description, precondition, empty query) and note that no template closely matched. Generate VQL from scratch using patterns in the guides.
