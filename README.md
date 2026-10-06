@@ -45,7 +45,8 @@ The workspace pairs Claude Code's agentic capabilities with Velociraptor's artif
 ## Workspace Structure
 
 ```
-custom/          Artifacts you author (by platform and category)
+custom/          Artifacts you author (by platform and category; gitignored)
+examples/        Complete, lab-tested artifacts built with this workspace
 templates/       Starter templates for common patterns
 scripts/         Setup, session-start, and helper scripts
 config/          Server config, API config, preferences (gitignored)

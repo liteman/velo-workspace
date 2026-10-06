@@ -36,7 +36,8 @@ Claude loads context automatically when certain terms appear. This is context lo
 ## Workspace Structure
 
 ```
-custom/          Artifacts you author — organized by platform and category
+custom/          Artifacts you author — organized by platform and category (gitignored)
+examples/        Complete, lab-tested artifacts (tracked; copy into custom/ to use)
 templates/       Starter templates (common/, windows/, macos/, linux/, server/)
 scripts/         Setup and session-start scripts
 config/          Server config, API config, workspace preferences (gitignored)
