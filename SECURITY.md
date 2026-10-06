@@ -19,6 +19,7 @@ The workspace API client (`workspace-client`) is created during `/setup` with a 
 
 | Permission | Purpose |
 |---|---|
+| `api` role | Grants `any_query`, required to run VQL over the API |
 | `read_results` | View clients, artifacts, hunts, and results |
 | `artifact_writer` | Upload and delete custom artifacts |
 | `server_artifact_writer` | Upload and delete server-type artifacts |
@@ -41,8 +42,10 @@ Some artifacts use `execve()` to run shell commands on endpoints (e.g., `systemc
 
 ```bash
 bin/velociraptor --config config/server.config.yaml acl grant workspace-client \
-  '{"read_results":true,"artifact_writer":true,"server_artifact_writer":true,"start_hunt":true,"execve":true}'
+  '{"roles":["api"],"read_results":true,"artifact_writer":true,"server_artifact_writer":true,"start_hunt":true,"execve":true}'
 ```
+
+`acl grant` replaces the whole policy — always restate `"roles":["api"]`, or the client loses `any_query` and every API call fails with `PERMISSION_DENIED`.
 
 To verify current permissions:
 
