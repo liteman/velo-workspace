@@ -27,6 +27,42 @@ the exec monitor gives *full command lines* if it was running beforehand. Scope
 `StealerUnifiedLog`'s `StartDate`/`EndDate` to a `CorrelatedWindow` from
 `BrowserCredentialStaging`.
 
+### Triage workflow
+
+For a suspected stealer infection on a host that was not running
+`KeychainCLIExec` beforehand:
+
+1. **`BrowserCredentialStaging`**: find credential files staged outside
+   their profiles. Note each `CorrelatedWindow`'s `SourceBtime`–`SourceMtime`.
+2. **`StealerUnifiedLog`** with `StartDate`/`EndDate` set to that window: get
+   the exact time, the process that requested the Safe Storage key, and
+   whether the user allowed or denied it.
+3. **`Exchange.MacOS.Applications.NetworkUsage`** (artifact exchange): check
+   per-process upload volume from `netusage.sqlite` around the same time to
+   confirm exfil and identify the uploading binary.
+4. **`MacOS.System.QuarantineEvents`** and **`MacOS.Detection.Autoruns`**
+   (built in): find the delivery (DMG download) and any persistence the
+   stealer left behind.
+
+### Related artifacts
+
+These cover adjacent ground. Use them alongside this set, not instead of it:
+
+- [`Exchange.MacOS.UnifiedLogHunter`](https://docs.velociraptor.app/exchange/artifacts/pages/macos.unifiedloghunter/):
+  general-purpose live unified log hunting with a library of named
+  predicates (logins, sudo, Gatekeeper, TCC, XProtect, MDM profiles). Uses
+  the same `log show` approach as `StealerUnifiedLog`, which adds
+  stealer-specific rules (Safe Storage keychain prompts with requester and
+  deny outcome), XProtect filtering to actual detections, and collapsing of
+  noisy per-process output.
+- [`Exchange.MacOS.UnifiedLogParser`](https://docs.velociraptor.app/exchange/artifacts/pages/macos.unifiedlogparser/):
+  offline unified log parsing with Mandiant's `unifiedlog_parser`, for
+  collected log archives where `log show` is unavailable.
+- [`Exchange.MacOS.Applications.NetworkUsage`](https://docs.velociraptor.app/exchange/artifacts/pages/macos.applications.networkusage/):
+  per-process network usage from `netusage.sqlite` (step 3 above).
+- `MacOS.Forensics.FSEvents` (built in): the generic FSEvents parser that
+  `BrowserCredentialStaging` imports.
+
 ### Requirements
 
 - **Full Disk Access for the Velociraptor binary** (grant via an MDM PPPC
