@@ -63,7 +63,7 @@ If no: report the error and stop. Do not reformat a file with known errors.
 Once verification is clean, run:
 
 ```bash
-bin/velociraptor artifacts reformat <file>
+bin/velociraptor --config config/server.config.yaml artifacts reformat <file>
 ```
 
 If the file was changed by reformat: note it briefly ("Reformatted — whitespace and indentation normalized.").

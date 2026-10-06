@@ -741,9 +741,43 @@ For commands that produce large output, always set `length=10000000`. The defaul
 FROM execve(argv=["systemctl", "list-units"], length=10000000)
 ```
 
+### execve() Errors Go to Stderr
+
+`execve()` returns `Stdout` and `Stderr` in separate columns. A query that selects only `Stdout` drops the tool's error messages, so a failing command (a bad `log` predicate, missing Full Disk Access, a bad flag) looks like "no results". Log stderr instead:
+
+```sql
+SELECT Stdout FROM execve(argv=["/usr/bin/log", "show", "--predicate", Q, "--style", "json"], length=10000000)
+WHERE if(condition=Stderr,
+         then=log(level="ERROR", message="log show: %v", args=Stderr, dedup=-1),
+         else=TRUE)
+  AND Stdout
+```
+
+`log()` returns true, so rows that have both stdout and stderr are kept. An ERROR-level log also makes a CLI collection exit non-zero.
+
 ---
 
 ## 9. Common Pitfalls
+
+### List Literals Only as Whole Arguments
+
+A `[...]` list literal parses only as the entire value of a function argument (`argv=["ls", "-la"]`, `else=[]`). Anywhere else it fails with `unexpected token`: in a `LET`, or as an operand of `+`. Use tuples, which work everywhere:
+
+```sql
+LET targets = ("a", "b")                 -- not ["a", "b"]
+LET single = ("a",)                      -- one-item tuple needs the trailing comma
+FROM execve(argv=("/bin/echo",) + extra) -- not ["/bin/echo"] + extra
+```
+
+### No LET Inside foreach() Query Blocks
+
+`LET` is not allowed inside `foreach(query={...})`. Compute per-row values in the `row=` query instead:
+
+```sql
+SELECT * FROM foreach(
+  row={ SELECT OSPath, stat(filename=OSPath) AS Info FROM glob(globs=Glob) },
+  query={ SELECT OSPath, Info.Size AS Size FROM scope() })
+```
 
 ### Bool Parameter Defaults
 

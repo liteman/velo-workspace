@@ -223,7 +223,40 @@ FROM glob(globs=parse_json_array(data=LaunchAgentsDaemonsGlob))
 
 ---
 
-## 9. SQLite Patterns for macOS Apps
+## 9. Unified Log and Endpoint Security
+
+### `log show` dates
+
+`log show --start/--end` parses dates as `%Y-%m-%d %H:%M:%S%z`. A date with no zone is read as **host local time**, so passing a UTC timestamp without an offset shifts the window by the host's UTC offset. `Z` and `+00:00` are rejected. Always format with an explicit numeric offset:
+
+```sql
+"--start", timestamp_format(time=StartDate, format="2006-01-02 15:04:05-0700"),
+```
+
+This produces `2026-10-06 09:02:49+0000` whatever the input zone.
+
+### `log show` predicates
+
+- Predicates use NSPredicate syntax, which accepts single- or double-quoted strings. Prefer single quotes when predicates live in a CSV parameter, so only rows containing a comma need CSV quoting.
+- A bad predicate prints `log: Bad predicate ...` to stderr and nothing to stdout. Log stderr (see `core.md`, execve section) or the filter silently returns 0 rows.
+- To test a predicate by hand in zsh, call `/usr/bin/log`: plain `log` is a zsh builtin.
+
+### securityd keychain messages
+
+Logged at Default level and not redacted, so no `--info` is needed:
+
+| Event | Match | Content |
+|---|---|---|
+| Keychain prompt shown | `process == 'securityd' AND category == 'kcacl' AND eventMessage BEGINSWITH 'displaying keychain prompt'` | `displaying keychain prompt for <path>(<pid>)` plus the item `desc:` (e.g. `Chrome Safe Storage`). Fires whether the user allows or denies. |
+| Access denied | `process == 'securityd' AND eventMessage BEGINSWITH 'ObjectAcl REJECTS'` | Category `acleval`. Logged when the user clicks Deny. |
+
+### eslogger JSON
+
+`eslogger` escapes forward slashes in its JSON (`\/usr\/bin\/security`). `jq` and `parse_json()` hide this, but a regex prefilter on raw lines must allow both forms: `\\?/`.
+
+---
+
+## 10. SQLite Patterns for macOS Apps
 
 Many macOS apps store data in SQLite databases. Standard pattern:
 
@@ -246,7 +279,7 @@ FROM foreach(
 
 ---
 
-## 10. Categories
+## 11. Categories
 
 | Category | Purpose |
 |---------|---------|
@@ -262,7 +295,7 @@ FROM foreach(
 
 ---
 
-## 11. Template Selection
+## 12. Template Selection
 
 | Use Case | Template |
 |---------|---------|
@@ -275,7 +308,7 @@ FROM foreach(
 
 ---
 
-## 12. macOS-Specific Checklist Items
+## 13. macOS-Specific Checklist Items
 
 In addition to the shared checklist in `core.md`:
 
@@ -284,5 +317,6 @@ In addition to the shared checklist in `core.md`:
 - **Glob format matched:** `split()` for comma-sep strings, `parse_json_array()` for JSON arrays, direct reference for single paths
 - **User extraction consistent:** pick one of the three patterns and apply it uniformly across all path references
 - **Backtick quoting used** for plist keys with dashes or dots (e.g., `` plist(file=OSPath).`persistent-apps` ``)
+- **`log show` dates have an explicit offset:** `timestamp_format(..., format="2006-01-02 15:04:05-0700")`, never a zone-less string
 - **Artifact name uses `MacOS` prefix:** `MacOS.Category.Name`
 - **File path in correct directory:** `custom/MacOS/<Category>/<Name>.yaml`

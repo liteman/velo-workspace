@@ -18,7 +18,7 @@ Before pushing, run validation:
 
 1. `bin/velociraptor artifacts verify <artifact_file>`
 2. If validation fails: show errors, explain them in plain language, offer to fix. Do NOT push a failing artifact.
-3. If validation passes: `bin/velociraptor artifacts reformat <artifact_file>` (clean formatting)
+3. If validation passes: `bin/velociraptor --config config/server.config.yaml artifacts reformat <artifact_file>` (clean formatting; reformat fails without `--config`)
 
 For `/push all`: validate all artifacts first, report any failures. Ask whether to continue pushing the valid ones or fix failures first.
 
