@@ -1,0 +1,196 @@
+name: Custom.MacOS.Forensics.StealerUnifiedLog
+description: |
+  Pulls infostealer-relevant entries from the macOS unified log: keychain
+  prompts for browser "Safe Storage" keys (with the requesting binary),
+  keychain secret reads by the `security` CLI, XProtect detections, TCC
+  requests for AppleEvents and Desktop/Documents, osascript and dscl activity.
+
+  Pairs with `Custom.MacOS.Detection.BrowserCredentialStaging`: FSEvents gives
+  a time window with no exact timestamps; this artifact gives timestamps with
+  no file paths. Scope `StartDate`/`EndDate` to a `CorrelatedWindow`'s
+  `SourceBtime`..`SourceMtime` to see what ran during the staging.
+
+  #### Reading the results
+  - **KeychainPromptSafeStorage** is the highest-fidelity row. Browser
+    "Safe Storage" items are ACL'd to the browser, so any other process
+    triggers a keychain prompt and securityd logs
+    `displaying keychain prompt for <path>(<pid>)` whether the user then
+    allows or denies. `Requester`, `RequesterPid` and `KeychainItem` are
+    extracted. Catches Keychain-API callers too, not just the `security` CLI.
+    Blind spot: no prompt (and no row) when a stealer exfils the keychain
+    file plus the phished password for offline decryption.
+  - **KeychainAccessRejected**: the user clicked Deny on such a prompt.
+  - **KeychainPrompt**: any other keychain prompt — context.
+  - **KeychainSecretRead** is noisy on developer machines — credential
+    helpers poll the keychain constantly via `security`. The log records no
+    arguments or parent, so a single row proves nothing; a read inside a
+    staging window is the lead.
+    Baseline on one dev Mac: ~1,700 rows/day.
+    Known source: Claude Code runs `security find-generic-password -w -s
+    "Claude Code-credentials"` on every session start and token refresh
+    (bursts during work hours, ~12/hour overnight). Confirmed with eslogger.
+    The stealer tell is the service name (`* Safe Storage`, `dump-keychain`),
+    which only exec telemetry (ESF/eslogger/EDR) records — not this log.
+  - **XProtectDetection** rows are high fidelity: XProtect's structured status
+    with a non-empty `caused_by`, or a status other than `NoThreatDetected` /
+    `Success` (remediators log `Success` for a clean scan).
+  - Many messages are redacted as `<private>` unless private logging is
+    enabled; absence of a string is not absence of activity.
+
+  #### Notes
+  - Shells out to `/usr/bin/log show` (needs the EXECVE permission to
+    collect). One pass with all rule predicates OR'd together, then rows are
+    labelled in VQL by each rule's `Match` regex against
+    `process|subsystem|category|message`.
+  - Rules with `Collapse=Y` are noisy per process (one osascript run logs
+    300+ lines) and fold to one row per Rule+Pid with `Lines`, first/last
+    timestamps and a sample message.
+  - Each 24h of log takes roughly a minute to scan; raise the collection
+    timeout for long lookbacks.
+
+author: liteman
+
+type: CLIENT
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+required_permissions:
+  - EXECVE
+
+parameters:
+  - name: Lookback
+    description: How far back to search (log show --last), e.g. 24h, 7d. Ignored when StartDate is set.
+    default: 7d
+    validating_regex: ^\d+[mhd]$
+  - name: StartDate
+    description: Optional window start, local time "YYYY-MM-DD HH:MM:SS".
+    validating_regex: ^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})?$
+  - name: EndDate
+    description: Optional window end, local time "YYYY-MM-DD HH:MM:SS".
+    validating_regex: ^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})?$
+  - name: Rules
+    type: csv
+    description: Predicate is passed to log show; Match is a regex over process|subsystem|category|message that labels the row (first matching rule wins); Collapse=Y folds rows to one per Rule+Pid.
+    default: |
+      Name,Predicate,Match,Collapse
+      KeychainPromptSafeStorage,"process == ""securityd"" AND category == ""kcacl"" AND eventMessage BEGINSWITH ""displaying keychain prompt"" AND eventMessage CONTAINS[c] ""Safe Storage""",^securityd\|[^|]*\|kcacl\|displaying keychain prompt.*(?i)safe storage,N
+      KeychainAccessRejected,"process == ""securityd"" AND eventMessage BEGINSWITH ""ObjectAcl REJECTS"" AND eventMessage CONTAINS[c] ""Safe Storage""",^securityd\|.*ObjectAcl REJECTS.*(?i)safe storage,N
+      KeychainPrompt,"process == ""securityd"" AND category == ""kcacl"" AND eventMessage BEGINSWITH ""displaying keychain prompt""",^securityd\|[^|]*\|kcacl\|displaying keychain prompt,N
+      XProtectDetection,"category == ""XPEvent.structured"" AND NOT (eventMessage CONTAINS '""caused_by"":[]' AND (eventMessage CONTAINS 'NoThreatDetected' OR eventMessage CONTAINS '""Success""'))",\|XPEvent\.structured\|,N
+      KeychainSecretRead,"process == ""security"" AND (eventMessage BEGINSWITH ""SecKeychainItemCopyContent"" OR eventMessage BEGINSWITH ""SecKeychainSearchCreateFromAttributes"" OR eventMessage BEGINSWITH ""SecKeychainOpen"")",^security\|.*\|SecKeychain(ItemCopyContent|SearchCreateFromAttributes|Open),Y
+      TCCAppleEvents,"subsystem == ""com.apple.TCC"" AND eventMessage CONTAINS ""kTCCServiceAppleEvents""",\|com\.apple\.TCC\|.*kTCCServiceAppleEvents,N
+      TCCDesktopDocuments,"subsystem == ""com.apple.TCC"" AND (eventMessage CONTAINS ""kTCCServiceSystemPolicyDocumentsFolder"" OR eventMessage CONTAINS ""kTCCServiceSystemPolicyDesktopFolder"")",\|com\.apple\.TCC\|.*kTCCServiceSystemPolicy(Documents|Desktop)Folder,N
+      Osascript,"process == ""osascript""",^osascript\|,Y
+      Dscl,"process == ""dscl""",^dscl\|,Y
+  - name: IncludeInfo
+    description: Include Info-level messages (log show --info). Several rules only match at Info level.
+    type: bool
+    default: Y
+
+sources:
+  - query: |
+      LET predicate = format(format="(%s)",
+                             args=join(array=Rules.Predicate, sep=") OR ("))
+      
+      -- VQL allows `+` on lists only in LET expressions (not inside function
+      -- arguments), and list literals there must be tuples, so build argv in steps.
+      LET end_args = if(condition=EndDate, then=("--end", EndDate), else=[])
+      
+      LET window_args = ("--start", StartDate) + end_args
+      
+      LET time_args = if(condition=StartDate,
+                         then=window_args,
+                         else=("--last", Lookback))
+      
+      LET info_args = if(condition=IncludeInfo, then=("--info", ), else=[])
+      
+      LET argv = ("/usr/bin/log", "show", "--style", "ndjson", "--predicate",
+            predicate) + time_args + info_args
+      
+      LET events = SELECT parse_json(data=Stdout) AS E
+        FROM execve(argv=argv, sep="\n", length=10000000)
+        WHERE Stdout =~ '^[{]'
+         AND log(message="log show argv: %v", args=[argv], dedup=-1)
+      
+      LET labelled = SELECT
+          E,
+          format(format="%s|%s|%s|%s",
+                 args=[basename(path=E.processImagePath),
+                   E.subsystem, E.category, E.eventMessage]) AS Key
+        FROM events
+        WHERE E.eventMessage
+      
+      -- Materialize once: the log show pass is the expensive part and both
+      -- the raw and collapsed views below read from it.
+      LET rows <= SELECT *
+        FROM foreach(row=labelled,
+                     query={
+          SELECT E.timestamp AS Timestamp,
+                 Name AS Rule,
+                 Collapse,
+                 basename(path=E.processImagePath) AS Process,
+                 E.processID AS Pid,
+                 E.userID AS Uid,
+                 E.subsystem AS Subsystem,
+                 E.category AS Category,
+                 E.eventMessage AS Message,
+                 E.processImagePath AS ProcessPath
+          FROM Rules
+          WHERE Key =~ Match
+          LIMIT 1
+        })
+      
+      LET single = SELECT Timestamp,
+                          Timestamp AS LastSeen,
+                          Rule,
+                          Process,
+                          Pid,
+                          Uid,
+                          Subsystem,
+                          Category,
+                          1 AS Lines,
+                          Message,
+                          ProcessPath
+        FROM rows
+        WHERE Collapse != "Y"
+      
+      LET collapsed = SELECT min(item=Timestamp) AS Timestamp,
+                             max(item=Timestamp) AS LastSeen,
+                             Rule,
+                             Process,
+                             Pid,
+                             Uid,
+                             Subsystem,
+                             Category,
+                             count() AS Lines,
+                             Message,
+                             ProcessPath
+        FROM rows
+        WHERE Collapse = "Y"
+        GROUP BY Rule, Pid
+      
+      LET prompt_regex = 'prompt for (?P<Requester>.+?)[(](?P<RequesterPid>[0-9]+)[)]'
+      
+      SELECT
+          Timestamp,
+          LastSeen,
+          Rule,
+          Process,
+          Pid,
+          Uid,
+          parse_string_with_regex(regex=prompt_regex, string=Message).Requester AS Requester,
+          parse_string_with_regex(
+            regex=prompt_regex,
+            string=Message).RequesterPid AS RequesterPid,
+          parse_string_with_regex(
+            regex='desc:(?P<Item>[^)]+)[)]',
+            string=Message).Item AS KeychainItem,
+          Subsystem,
+          Category,
+          Lines,
+          Message,
+          ProcessPath
+      FROM chain(
+        a=single,
+        b=collapsed)
+      ORDER BY Timestamp
