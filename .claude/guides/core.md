@@ -929,7 +929,7 @@ A hidden alias (`_Name`) works in `WHERE`, but can resolve to Null when another 
 
 - **No `%` modulo operator.**
 - **`base64decode()` rejects unpadded base64url** (JWT segments). Try each padding: `base64decode(string=x) || base64decode(string=x + "=") || base64decode(string=x + "==")`.
-- **No `parse_urlencoded()` in 0.75.5.** Split `url(parse=U).RawQuery` on `&`, then on `=`.
+- **No `parse_urlencoded()`** (checked on 0.75.5 and 0.77.3). Split `url(parse=U).RawQuery` on `&`, then on `=`.
 - **Top-level JSON arrays** need `parse_json_array()`; `parse_json()` expects an object.
 - **`parse_yaml(filename=)` reads a file**, not a string (`data=` returns Null). It handles kubeconfig-style files.
 

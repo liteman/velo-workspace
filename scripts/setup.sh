@@ -94,40 +94,37 @@ phase_prereqs() {
         installed_ver="$("$binary" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown')"
         success "Velociraptor binary found: $installed_ver"
     else
-        info "Fetching latest stable Velociraptor release tag..."
+        info "Fetching latest stable Velociraptor release..."
 
         require_cmd curl
+        require_cmd gunzip
 
-        # Get latest stable tag — exclude -rc pre-releases
-        local api_url="https://api.github.com/repos/Velocidex/velociraptor/releases"
-        local latest_tag
-        latest_tag="$(curl -fsSL "$api_url" \
-            | grep '"tag_name"' \
-            | grep -v '\-rc' \
-            | head -1 \
-            | sed 's/.*"tag_name": *"\(.*\)".*/\1/')" \
-            || fail "Failed to fetch release list from GitHub. Check your internet connection."
+        # /releases/latest excludes pre-releases and drafts.
+        local release_json
+        release_json="$(curl -fsSL "https://api.github.com/repos/Velocidex/velociraptor/releases/latest")" \
+            || fail "Failed to fetch the latest release from GitHub. Check your internet connection."
 
-        [[ -n "$latest_tag" ]] || fail "Could not determine latest stable release tag."
-
-        # Release tags (e.g. v0.75) don't match asset filenames (e.g. v0.75.3).
-        # Each release bundles multiple patch builds; pick the highest one.
+        # A release can bundle several patch builds; pick the highest.
+        # Assets are gzipped since v0.77 (velociraptor-v0.77.3-darwin-arm64.gz).
         local asset_suffix="${VL_OS}-${VL_ARCH}"
-        local asset_name
-        asset_name="$(curl -fsSL "$api_url/tags/${latest_tag}" \
-            | grep '"name"' \
-            | grep -o "velociraptor-v[0-9.]*-${asset_suffix}" \
-            | sort -t. -k1,1n -k2,2n -k3,3n \
-            | tail -1)" \
-            || fail "Failed to find a matching asset for ${asset_suffix} in release ${latest_tag}."
+        local download_url
+        download_url="$(printf '%s' "$release_json" \
+            | grep '"browser_download_url"' \
+            | grep -oE "https://[^\"]*/velociraptor-v[0-9.]+-${asset_suffix}(\.gz)?\"" \
+            | tr -d '"' \
+            | sort -V \
+            | tail -1)"
 
-        [[ -n "$asset_name" ]] || fail "No asset matching *-${asset_suffix} found in release ${latest_tag}."
+        [[ -n "$download_url" ]] || fail "No asset matching *-${asset_suffix} found in the latest release."
 
-        local download_url="https://github.com/Velocidex/velociraptor/releases/download/${latest_tag}/${asset_name}"
-
-        info "Downloading $asset_name..."
-        if ! curl -fsSL -o "$binary" "$download_url"; then
+        info "Downloading ${download_url##*/}..."
+        local download_path="$binary"
+        [[ "$download_url" == *.gz ]] && download_path="$binary.gz"
+        if ! curl -fsSL -o "$download_path" "$download_url"; then
             fail "Download failed for $download_url. Check network access or download manually from https://docs.velociraptor.app/downloads/ and place the binary at $BIN_DIR/velociraptor."
+        fi
+        if [[ "$download_path" == *.gz ]]; then
+            gunzip -f "$download_path" || fail "Failed to decompress $download_path."
         fi
 
         chmod +x "$binary"

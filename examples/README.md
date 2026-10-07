@@ -139,8 +139,8 @@ docker of a typical deploy script).
 - `TokenStoreAccess`: Velociraptor with eBPF on Linux (kernel 5.8+ with BTF),
   root. Run `Linux.Events.TrackProcesses` alongside it for command lines.
   Short-lived readers like `cat` exit before the alert can look them up.
-  `artifacts verify` with the **macOS** binary rejects its `watch_ebpf(policy=)`
-  argument (the darwin build has no eBPF). Verify with a Linux binary.
+  `artifacts verify` with a **macOS 0.75.x** binary rejects its
+  `watch_ebpf(policy=)` argument; 0.77.3 on macOS verifies it.
 - `TokenStoreInventory`: reading a store to parse it updates its atime. Run
   with `ParseContents=N` first if atime evidence matters.
 - `HarFileTokens`: parses each HAR in memory (`MaxSize`, default 200 MB).

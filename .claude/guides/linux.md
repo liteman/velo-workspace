@@ -620,9 +620,9 @@ FROM delay(delay=2, query={
 
 Under the default `relatime` mount option, the first read after each write updates atime. A forensic artifact that parses a file erases the "read since last write" signal for every later run. Offer a `ParseContents=N` parameter that collects metadata only, and say so in the description.
 
-### watch_ebpf() Not Verifiable on macOS
+### watch_ebpf() policy= Needs 0.77+ to Verify on macOS
 
-The darwin build's `watch_ebpf` stub has no `policy` argument, so `/check` fails there on policy-based artifacts. Verify with a Linux Velociraptor binary.
+The 0.75.x darwin build's `watch_ebpf` stub has no `policy` argument, so `/check` fails on policy-based artifacts there. 0.77.3 verifies them on macOS; with an older workspace binary, verify with a Linux Velociraptor binary.
 
 ### Process Tracker Dependency
 
