@@ -50,11 +50,12 @@ These cover adjacent ground. Use them alongside this set, not instead of it:
 
 - [`Exchange.MacOS.UnifiedLogHunter`](https://docs.velociraptor.app/exchange/artifacts/pages/macos.unifiedloghunter/):
   general-purpose live unified log hunting with a library of named
-  predicates (logins, sudo, Gatekeeper, TCC, XProtect, MDM profiles). Uses
-  the same `log show` approach as `StealerUnifiedLog`, which adds
-  stealer-specific rules (Safe Storage keychain prompts with requester and
-  deny outcome), XProtect filtering to actual detections, and collapsing of
-  noisy per-process output.
+  predicates (logins, sudo, Gatekeeper, TCC, XProtect, MDM profiles). Since
+  [velociraptor-docs#1319](https://github.com/Velocidex/velociraptor-docs/pull/1319)
+  it also ships Browser Safe Storage keychain prompt/deny and XProtect
+  detection filters (select them with `FilterRegex`, e.g. `Safe Storage`).
+  `StealerUnifiedLog` uses the same `log show` approach and adds
+  osascript/dscl rules and collapsing of noisy per-process output.
 - [`Exchange.MacOS.UnifiedLogParser`](https://docs.velociraptor.app/exchange/artifacts/pages/macos.unifiedlogparser/):
   offline unified log parsing with Mandiant's `unifiedlog_parser`, for
   collected log archives where `log show` is unavailable.
