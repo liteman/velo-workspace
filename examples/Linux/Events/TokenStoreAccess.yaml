@@ -1,0 +1,229 @@
+name: Custom.Linux.Events.TokenStoreAccess
+description: |
+  Alerts when one process, or the children of one parent, opens the
+  credential stores of several different developer tools within a short
+  window: the sweep pattern of malicious packages, compromised developer
+  tooling, and secret scanners run by attackers.
+
+  Watches file opens with eBPF (`security_file_open`) on the real stores in
+  home directories: AWS (`~/.aws`, including the IAM Identity Center
+  `sso/cache`), Azure CLI, gcloud, kube, docker, npm, pypi, git, `gh`, and
+  SSH private keys.
+
+  #### Why breadth, not caller
+  A malicious `postinstall` script runs inside `node` or `python`, the same
+  interpreters the real CLIs use (`az` and `gcloud` are Python), so caller
+  allowlists cannot separate them. Legitimate tools read their own store:
+  `aws` never opens `~/.kube/config` and `~/.npmrc`. A harvester reads all
+  of them. The rule counts **distinct tools** per process:
+
+  - **ProcessSweep**: one process opened stores of `ProcessThreshold` or more
+    tools within `SweepWindow` seconds (`tar` of the home directory, a secret
+    scanner such as `trufflehog`, an in-process harvester).
+  - **ParentSweep**: the children of one parent did so together, catching a
+    script that runs `cat` or `curl` once per file. The default threshold is
+    higher because deploy scripts legitimately call `aws`, `kubectl` and
+    `docker` in sequence.
+
+  Once a process crosses the threshold, each further tool it reaches adds
+  one row; `ToolsInWindow` lists every tool reached so far, including those
+  before the alert. Set `ReportAll` to emit every store open for baselining.
+
+  #### Known noise
+  Home-directory backups (`rsync`, `restic`, `borg`), file indexers, and IDE
+  extension hosts that load cloud plugins (one `node` process reading kube,
+  AWS and docker configs). Exclude by `ExcludeProcessRegex` only after
+  checking: malicious IDE extensions run in that same process.
+
+  #### Requirements
+  - Velociraptor 0.74+ with eBPF (kernel 5.8+ with BTF), running as root.
+  - Process command lines come from `Linux.Events.TrackProcesses` when it is
+    running (recommended: short-lived readers like `cat` exit before the
+    alert can look them up). Without it, the artifact falls back to
+    `pslist()` and may report only the process name.
+  - Service-account homes outside `/home` and `/root` (CI runners in
+    `/var/lib/jenkins`) need adding to `PathPrefixes`.
+
+author: liteman
+
+type: CLIENT_EVENT
+
+precondition: SELECT OS FROM info() WHERE OS = 'linux' AND version(plugin="watch_ebpf") >= 2
+
+parameters:
+  - name: Stores
+    type: csv
+    description: Tool owning each store; PathRegex matches the opened path. Sweeps count distinct Tool values.
+    default: |
+      Tool,PathRegex
+      aws,/\.aws/(credentials|config|sso/cache/[^/]+\.json|cli/cache/[^/]+\.json)$
+      azure,/\.azure/(msal_token_cache\.(json|bin)|accessTokens\.json|service_principal_entries\.(json|bin))$
+      gcloud,/\.config/gcloud/(credentials\.db|access_tokens\.db|application_default_credentials\.json|legacy_credentials/.+)$
+      kube,/\.kube/config$
+      docker,/\.docker/config\.json$
+      npm,/\.npmrc$
+      pypi,/\.pypirc$
+      git,/\.git-credentials$
+      gh,/\.config/gh/hosts\.yml$
+      ssh,/\.ssh/id_[^/.]+$
+  - name: PathPrefixes
+    description: Comma-separated kernel-side path filter (tracee policy). Only opens under these prefixes reach VQL.
+    default: /home/*,/root/*
+  - name: SweepWindow
+    type: int
+    description: Seconds of history a sweep is counted over.
+    default: 60
+  - name: ProcessThreshold
+    type: int
+    default: 3
+  - name: ParentThreshold
+    type: int
+    default: 4
+  - name: ExcludeProcessRegex
+    type: regex
+    description: Process names (comm) to ignore entirely. Empty = none.
+    default: ""
+  - name: ReportAll
+    type: bool
+    description: Also emit every store open (Finding=Access), for baselining.
+    default: N
+
+sources:
+  - query: |
+      LET Policy = format(
+          format='''
+      metadata:
+        name: token-store-opens
+      spec:
+        scope:
+          - global
+        rules:
+          - event: security_file_open
+            filters:
+              - args.pathname=%v
+      ''',
+          args=PathPrefixes)
+      
+      LET StoreList <= SELECT Tool,
+                              PathRegex
+        FROM Stores
+      
+      LET MyPid <= getpid()
+      
+      LET raw = SELECT *
+        FROM watch_ebpf(events="security_file_open", policy=Policy)
+        WHERE System.HostProcessID != MyPid
+         AND if(condition=ExcludeProcessRegex,
+                then=NOT System.ProcessName =~ ExcludeProcessRegex,
+                else=TRUE)
+      
+      LET opens = SELECT *
+        FROM foreach(row=raw,
+                     query={
+          SELECT timestamp(string=System.Timestamp) AS Time,
+                 System.HostProcessID AS Pid,
+                 System.HostParentProcessID AS Ppid,
+                 System.ProcessName AS Process,
+                 System.UserID AS Uid,
+                 EventData.pathname AS Path,
+                 Tool,
+                 format(format="%v|%v",
+                        args=[System.HostProcessID, EventData.pathname]) AS _OpenKey
+          FROM StoreList
+          WHERE EventData.pathname =~ PathRegex
+          LIMIT 1
+        })
+      
+      -- eBPF reports some opens twice; keep one per process and path.
+      LET unique_opens = SELECT *
+        FROM dedup(query=opens, key="_OpenKey", timeout=SweepWindow)
+      
+      -- Sweep state: "P|<pid>|<tool>" and "C|<ppid>|<tool>" -> last open
+      -- time. One eBPF subscription only; a second watcher with the same
+      -- policy (e.g. via fifo()) receives no events.
+      LET Seen <= lru(size=20000)
+      
+      LET Tools <= SELECT Tool
+        FROM StoreList
+        GROUP BY Tool
+      
+      LET ToolsSince(Prefix, Id, Since) = SELECT Tool
+        FROM Tools
+        WHERE get(item=Seen,
+                  field=format(format="%v|%v|%v", args=[Prefix, Id, Tool])) >
+          Since
+      
+      LET recorded = SELECT *, now() AS _Now
+        FROM unique_opens
+        WHERE set(item=Seen,
+                  field=format(format="P|%v|%v", args=[Pid, Tool]),
+                  value=now())
+         AND set(item=Seen,
+                 field=format(format="C|%v|%v", args=[Ppid, Tool]),
+                 value=now())
+      
+      LET scored = SELECT
+          *, ToolsSince(Prefix="P", Id=Pid, Since=_Now - SweepWindow).Tool AS _ProcessTools,
+          ToolsSince(
+            Prefix="C",
+            Id=Ppid,
+            Since=_Now - SweepWindow).Tool AS _ParentTools
+        FROM recorded
+      
+      LET findings = SELECT
+          *, if(condition=len(list=_ProcessTools) >= ProcessThreshold,
+                then="ProcessSweep",
+                else=if(
+                  condition=len(list=_ParentTools) >= ParentThreshold,
+                  then="ParentSweep",
+                  else=if(condition=ReportAll, then="Access"))) AS Finding
+        FROM scored
+        WHERE Finding
+      
+      LET PsInfo(P) = SELECT Exe,
+                             CommandLine,
+                             Username
+        FROM pslist(pid=P)
+      
+      LET ProcInfo(P) = process_tracker_get(id=P).Data ||
+          PsInfo(P=P)[0]
+      
+      LET alerts = SELECT Time,
+                          Finding,
+                          Tool,
+                          Path,
+                          if(condition=Finding = "ParentSweep",
+                             then=_ParentTools,
+                             else=_ProcessTools) AS ToolsInWindow,
+                          Pid,
+                          Process,
+                          Uid,
+                          ProcInfo(P=Pid) AS _Proc,
+                          Ppid,
+                          ProcInfo(P=Ppid) AS _Parent,
+                          join(array=process_tracker_callchain(id=Pid).Data.Name,
+                               sep=" -> ") AS CallChain,
+                          format(format="%v|%v|%v",
+                                 args=[Finding, if(
+                                   condition=Finding = "ParentSweep",
+                                   then=Ppid,
+                                   else=Pid), if(
+                                   condition=Finding = "Access",
+                                   then=Path,
+                                   else=Tool)]) AS _AlertKey
+        FROM delay(query=findings, delay=2)
+      
+      SELECT Time,
+             Finding,
+             Tool,
+             Path,
+             ToolsInWindow,
+             Pid,
+             Process,
+             _Proc.Exe AS Exe,
+             _Proc.CommandLine AS CommandLine,
+             _Proc.Username || Uid AS User,
+             Ppid,
+             _Parent.CommandLine AS ParentCommandLine,
+             CallChain
+      FROM dedup(query=alerts, key="_AlertKey", timeout=SweepWindow)

@@ -4,7 +4,7 @@ Complete artifacts built with this workspace. To use one, copy it into
 `custom/` (same relative path), then `/check`, `/test`, and `/push` as usual:
 
 ```bash
-cp -r examples/MacOS custom/
+cp -r examples/MacOS custom/      # or examples/Linux, examples/Generic
 ```
 
 ## macOS infostealer detection set
@@ -63,3 +63,65 @@ Safe Storage read denied at the prompt, `dump-keychain`, `ditto` staging zip,
 
 Tune the regex parameters (`Rules`, `ExpectedPathRegex`, `StagingPathRegex`)
 for your fleet. Each artifact's description lists its known noise sources.
+
+## Developer token theft set (Linux, plus a cross-platform HAR hunt)
+
+The Linux counterpart to the macOS set, aimed at the Linux threat rather than
+a port: malicious packages and compromised developer tooling that sweep the
+plaintext token caches modern CLIs keep in home directories
+(`~/.aws/sso/cache`, `~/.azure/msal_token_cache.json`,
+`~/.config/gcloud/credentials.db`, `~/.kube/config`, `~/.npmrc`, ...), and HAR
+files exported for support tickets that carry live session cookies and bearer
+tokens. Either way the attacker replays a token, so cloud audit logs show
+normal, authorized activity.
+
+| Artifact | Type | Answers |
+|---|---|---|
+| `Custom.Linux.Events.TokenStoreAccess` | `CLIENT_EVENT` | **Live:** which process (or which parent's children) opened the credential stores of several different tools within a minute, with command line, parent and call chain (eBPF `security_file_open`). |
+| `Custom.Linux.Forensics.TokenStoreInventory` | `CLIENT` | **Scoping:** which tokens and keys sit on the host, whose they are, whether they are still live, and whether each store was read since it was last written. Details are revocation and pivot metadata only (accounts, tenants, AWS access key IDs for CloudTrail, kube auth kinds), never secret values. |
+| `Custom.Generic.Detection.HarFileTokens` | `CLIENT` | **Exposure:** HAR files on Linux, macOS or Windows that contain `Authorization` headers, session cookies, API keys or signed-URL signatures, per host, with decoded JWT issuer/subject/expiry. Names only, never values. |
+
+**How they fit together:** `TokenStoreAccess` alerts on the sweep and names
+the process. `TokenStoreInventory` on the same host lists what that process
+could reach and which of it is still live, which is the revocation list.
+`HarFileTokens` covers credentials that leak through support workflows
+instead of malware.
+
+### Detection logic: breadth, not caller
+
+The same rule as the macOS set, from the other direction. A malicious
+`postinstall` script runs in `node` or `python`, the same interpreters the
+real CLIs use, so caller allowlists cannot separate them. A legitimate tool
+reads its own store, while a harvester reads everyone's. `TokenStoreAccess`
+counts **distinct tools** per process (`ProcessThreshold`, default 3) and per
+parent's children (`ParentThreshold`, default 4, above the aws + kubectl +
+docker of a typical deploy script).
+
+### Requirements
+
+- `TokenStoreAccess`: Velociraptor with eBPF on Linux (kernel 5.8+ with BTF),
+  root. Run `Linux.Events.TrackProcesses` alongside it for command lines.
+  Short-lived readers like `cat` exit before the alert can look them up.
+  `artifacts verify` with the **macOS** binary rejects its `watch_ebpf(policy=)`
+  argument (the darwin build has no eBPF). Verify with a Linux binary.
+- `TokenStoreInventory`: reading a store to parse it updates its atime. Run
+  with `ParseContents=N` first if atime evidence matters.
+- `HarFileTokens`: parses each HAR in memory (`MaxSize`, default 200 MB).
+
+### Validation
+
+Tested with Velociraptor 0.77.3 (linux-arm64) in an Ubuntu 24.04 container
+(Docker Desktop, kernel 6.12) against a fixture home directory with
+structurally real, fake-valued stores for all ten tools, and a HAR with a
+JWT bearer token, session cookies, an API key and an Azure SAS URL:
+
+- `TokenStoreAccess`: a single `aws` credential read and a deploy-style
+  script (aws, kube, docker) stayed silent. `tar` of the home directory and
+  in-process reads raised `ProcessSweep`, and a one-`cat`-per-file script
+  raised `ParentSweep`. All alerts carried full command lines and call chains.
+- `TokenStoreInventory`: 22 stores parsed. Live vs expired tokens, AKIA vs
+  ASIA keys, encrypted vs unencrypted SSH keys and kube auth kinds were all
+  correct. The one store read after its last write was the only one flagged.
+- `HarFileTokens`: all four credential-bearing hosts found, JWT
+  issuer/subject/expiry decoded, and the sanitized HAR reported clean.
+- None of the fixture's secret values appeared in any output.

@@ -1,0 +1,497 @@
+name: Custom.Linux.Forensics.TokenStoreInventory
+description: |
+  Inventories the developer and cloud credential stores in every home
+  directory: which tokens and keys are on the host, whose they are, whether
+  they are still live, and when each store was last read. **Secret values are
+  never output.**
+
+  Modern CLIs cache high-privilege tokens in plaintext: AWS IAM Identity
+  Center tokens in `~/.aws/sso/cache`, Azure CLI MSAL tokens in
+  `~/.azure/msal_token_cache.json`, gcloud refresh tokens in
+  `~/.config/gcloud/credentials.db`, cluster tokens in `~/.kube/config`.
+  Malicious packages and compromised developer tooling sweep these paths.
+  When a host is suspected, this artifact answers "what could have been
+  taken, and what do we revoke?"
+
+  Per store, `Details` holds the non-secret metadata needed to revoke or to
+  pivot into cloud audit logs:
+
+  - **AWS**: profiles, access key IDs (`AKIA` = long-term key, `ASIA` =
+    temporary), SSO start URLs and role ARNs, token expiry. Search
+    CloudTrail for the access key IDs.
+  - **Azure**: signed-in accounts, tenants and subscriptions, access and
+    refresh token counts, service principal client IDs with stored secrets.
+  - **gcloud**: accounts (user and service account), access token expiry,
+    ADC credential type.
+  - **kube**: clusters, servers and each user's auth kind (static `token`
+    and `client-cert` are stealable; `exec` plugins are not).
+  - **docker / npm / pypi / git / gh**: registries and hosts with inline
+    credentials.
+  - **ssh**: private keys and whether they are passphrase-protected.
+
+  #### Timestamps
+  `ReadSinceWrite` is true when the file's access time is later than its
+  modification time: something read it after it was last written. Linux
+  mounts default to `relatime`, which updates atime only once per 24 hours
+  after the first read, so `Atime` is "read at least once since", not "last
+  read". `noatime` mounts never update it. For read-level detail, run
+  `Custom.Linux.Events.TokenStoreAccess` beforehand.
+
+  This artifact reads the stores to parse them, which itself updates atime.
+  `Atime` is captured before the read, so the first collection is accurate.
+  Later collections see the artifact's own read. Run it once with
+  `ParseContents=N` first if atime evidence matters.
+
+  Run it with `Custom.Linux.Events.TokenStoreAccess` alerts to scope which
+  stores the sweeping process could reach.
+
+author: liteman
+
+type: CLIENT
+
+precondition: SELECT OS FROM info() WHERE OS = 'linux'
+
+parameters:
+  - name: Stores
+    type: csv
+    description: Globs are relative to each home directory in /etc/passwd. Parser selects the metadata extractor (none = file facts only).
+    default: |
+      Tool,Store,Glob,Parser
+      aws,Credentials,.aws/credentials,aws_ini
+      aws,Config,.aws/config,aws_ini
+      aws,SsoCache,.aws/sso/cache/*.json,aws_json
+      aws,CliCache,.aws/cli/cache/*.json,aws_json
+      azure,MsalTokenCache,.azure/msal_token_cache.json,azure_msal
+      azure,MsalTokenCacheEncrypted,.azure/msal_token_cache.bin,none
+      azure,LegacyAccessTokens,.azure/accessTokens.json,azure_legacy
+      azure,Profile,.azure/azureProfile.json,azure_profile
+      azure,ServicePrincipals,.azure/service_principal_entries.json,azure_sp
+      gcloud,Credentials,.config/gcloud/credentials.db,gcloud_credentials
+      gcloud,AccessTokens,.config/gcloud/access_tokens.db,gcloud_tokens
+      gcloud,ApplicationDefault,.config/gcloud/application_default_credentials.json,gcloud_adc
+      gcloud,Legacy,.config/gcloud/legacy_credentials/*/adc.json,gcloud_adc
+      kube,Config,.kube/config,kube
+      docker,Config,.docker/config.json,docker
+      npm,Npmrc,.npmrc,npmrc
+      pypi,Pypirc,.pypirc,pypirc
+      git,Credentials,.git-credentials,git_credentials
+      gh,Hosts,.config/gh/hosts.yml,gh
+      ssh,PrivateKey,.ssh/id_*,ssh_key
+  - name: HomeExcludeRegex
+    type: regex
+    description: Home directories from /etc/passwd to skip.
+    default: ^(/|/nonexistent|/dev/null|/proc|/sys|/s?bin|/usr/s?bin)/?$
+  - name: ParseContents
+    type: bool
+    description: Read each store to extract Details. Reading updates the file's atime (once, under relatime), so a later collection loses ReadSinceWrite evidence. Set N to report file facts only.
+    default: Y
+  - name: MaxFileSize
+    type: int
+    description: Bytes read per store file.
+    default: 10000000
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: Atime
+    type: timestamp
+  - name: Ctime
+    type: timestamp
+  - name: TokenExpiry
+    type: timestamp
+
+sources:
+  - query: |
+      LET passwd <= SELECT User,
+                           Uid,
+                           Homedir
+        FROM split_records(
+          filenames="/etc/passwd",
+          regex=":",
+          columns=["User", "X", "Uid", "Gid", "Desc", "Homedir", "Shell"])
+      
+      LET homes = SELECT Homedir,
+                         enumerate(items=User) AS Users
+        FROM passwd
+        WHERE Homedir
+         AND NOT Homedir =~ HomeExcludeRegex
+        GROUP BY Homedir
+      
+      LET StoreGlobs <= SELECT *, "/" + Glob AS RootedGlob
+        FROM Stores
+      
+      LET files = SELECT *
+        FROM foreach(row=homes,
+                     query={
+          SELECT *
+          FROM foreach(row={
+          SELECT OSPath,
+                 Name,
+                 Size,
+                 Mode.String AS Mode,
+                 Mtime,
+                 Atime,
+                 Ctime,
+                 Globs
+          FROM glob(globs=StoreGlobs.Glob, root=Homedir)
+          WHERE NOT IsDir
+           AND NOT Name =~ '\\.pub$'
+        },
+                       query={
+          SELECT Homedir,
+                 join(array=Users, sep=",") AS HomeUsers,
+                 Tool,
+                 Store,
+                 if(condition=ParseContents, then=Parser, else="none") AS Parser,
+                 OSPath,
+                 Size,
+                 Mode,
+                 Mtime,
+                 Atime,
+                 Ctime
+          FROM StoreGlobs
+          WHERE RootedGlob IN Globs
+          LIMIT 1
+        })
+        })
+      
+      LET Text(P) = read_file(filename=P, length=MaxFileSize)
+      
+      LET Json(P) = parse_json(data=regex_replace(
+                                 source=Text(P=P),
+                                 re='^\\x{FEFF}',
+                                 replace=''))
+      
+      LET JsonArray(P) = parse_json_array(data=Text(P=P))
+      
+      LET Field(Body, Key) = parse_string_with_regex(
+          regex='(?m)^\\s*' + Key + '\\s*=\\s*(?P<V>\\S+)',
+          string=Body).V
+      
+      LET IniSections(P) = SELECT Section,
+                                  Body
+        FROM parse_records_with_regex(
+          file=P,
+          regex='(?m)^\\[(?P<Section>[^\\]\\n]+)\\][^\\n]*\\n(?P<Body>(?:[^\\[\\n][^\\n]*\\n?|\\n)*)')
+      
+      -- Parsers: each returns non-secret metadata only.
+      LET AwsIni(P) = dict(Profiles={
+          SELECT
+          regex_replace(source=Section, re='^profile\\s+', replace='') AS Profile,
+          Field(Body=Body, Key="aws_access_key_id") AS AccessKeyId,
+          Body =~ '(?m)^\\s*aws_secret_access_key\\s*=' AS HasSecretKey,
+          Body =~ '(?m)^\\s*aws_session_token\\s*=' AS HasSessionToken,
+          Field(Body=Body, Key="sso_start_url") AS SsoStartUrl,
+          Field(Body=Body, Key="sso_account_id") AS SsoAccountId,
+          Field(Body=Body, Key="sso_role_name") AS SsoRoleName,
+          Field(Body=Body, Key="role_arn") AS RoleArn
+          FROM IniSections(P=P)
+        })
+      
+      LET AwsJson(J) = dict(
+          Kind=if(condition=J.accessToken,
+                  then="SsoAccessToken",
+                  else=if(condition=J.clientSecret,
+                          then="SsoClientRegistration",
+                          else=if(condition=J.Credentials,
+                                  then="AssumedRoleCredentials",
+                                  else="Unknown"))),
+          StartUrl=J.startUrl,
+          Region=J.region,
+          HasRefreshToken=J.refreshToken != NULL,
+          AccessKeyId=J.Credentials.AccessKeyId,
+          RoleArn=J.AssumedRoleUser.Arn,
+          Expiry=timestamp(string=J.expiresAt || J.Credentials.Expiration))
+      
+      LET MsalClientIds(J) = SELECT _value.client_id AS ClientId
+        FROM items(item=J.RefreshToken)
+        GROUP BY ClientId
+      
+      LET MsalExpiry(J) = SELECT timestamp(epoch=int(int=_value.expires_on)) AS E
+        FROM items(item=J.AccessToken)
+        ORDER BY E DESC
+        LIMIT 1
+      
+      LET AzureMsal(J) = dict(Accounts={
+          SELECT _value.username AS Username,
+                 _value.realm AS TenantId,
+                 _value.environment AS Environment
+          FROM items(item=J.Account)
+        },
+                              ClientIds=MsalClientIds(J=J).ClientId,
+                              AccessTokens=len(list=items(item=J.AccessToken)),
+                              RefreshTokens=len(list=items(item=J.RefreshToken)),
+                              Expiry=MsalExpiry(J=J)[0].E)
+      
+      LET LegacyUsers(J) = SELECT userId
+        FROM foreach(row=J)
+        GROUP BY userId
+      
+      LET LegacyExpiry(J) = SELECT timestamp(string=expiresOn) AS E
+        FROM foreach(row=J)
+        ORDER BY E DESC
+        LIMIT 1
+      
+      LET AzureLegacy(J) = dict(Users=LegacyUsers(J=J).userId,
+                                Tokens=len(list=J),
+                                RefreshTokens=len(list=filter(
+                                                    list=
+                                                      J.refreshToken,
+                                                    condition="x=>x")),
+                                Expiry=LegacyExpiry(J=J)[0].E)
+      
+      LET AzureProfile(J) = dict(Subscriptions={
+          SELECT name AS Name,
+                 id AS Id,
+                 tenantId AS TenantId,
+                 user.name AS User,
+                 user.type AS UserType
+          FROM foreach(row=J.subscriptions)
+        })
+      
+      LET AzureSp(J) = dict(ServicePrincipals={
+          SELECT client_id AS ClientId,
+                 tenant AS TenantId,
+                 client_secret != NULL AS HasSecret,
+                 certificate != NULL AS HasCertificate
+          FROM foreach(row=J)
+        })
+      
+      LET GcloudCredentials(P) = dict(Accounts={
+          SELECT account_id AS Account,
+                 parse_json(data=value).type AS Type
+          FROM sqlite(file=P, query="SELECT account_id, value FROM credentials")
+        })
+      
+      LET GcloudTokenRows(P) = SELECT account_id AS Account,
+                                      timestamp(string=token_expiry) AS Expiry
+        FROM sqlite(file=P,
+                    query="SELECT account_id, token_expiry FROM access_tokens")
+        ORDER BY Expiry DESC
+      
+      LET GcloudTokens(P) = dict(Accounts=GcloudTokenRows(P=P),
+                                 Expiry=GcloudTokenRows(P=P)[0].Expiry)
+      
+      LET GcloudAdc(J) = dict(Type=J.type,
+                              ClientEmail=J.client_email,
+                              Account=J.account,
+                              QuotaProject=J.quota_project_id,
+                              HasRefreshToken=J.refresh_token != NULL,
+                              HasPrivateKey=J.private_key != NULL)
+      
+      LET KubeAuth(U) = if(condition=U.token OR U.tokenFile,
+                           then="token",
+                           else=if(
+                             condition=get(item=U, field="client-key-data") OR
+                               get(item=U, field="client-key"),
+                             then="client-cert",
+                             else=if(
+                               condition=U.exec,
+                               then="exec:" + U.exec.command,
+                               else=if(
+                                 condition=get(item=U, field="auth-provider"),
+                                 then="auth-provider",
+                                 else=if(condition=U.password,
+                                         then="basic",
+                                         else="none")))))
+      
+      LET Kube(Y) = dict(CurrentContext=get(item=Y, field="current-context"),
+                         Clusters={
+          SELECT name AS Name,
+                 cluster.server AS Server
+          FROM foreach(row=Y.clusters)
+        },
+                         Users={
+          SELECT name AS Name,
+                 KubeAuth(U=user) AS Auth
+          FROM foreach(row=Y.users)
+        })
+      
+      LET Docker(J) = dict(Registries={
+          SELECT
+          _key AS Registry,
+          _value.auth != NULL OR _value.identitytoken != NULL AS InlineCredential
+          FROM items(item=J.auths)
+        },
+                           CredsStore=J.credsStore,
+                           CredHelpers=items(item=J.credHelpers)._key)
+      
+      LET Npmrc(P) = dict(
+          InlineCredentials={
+          SELECT R.Registry AS Registry,
+                 R.Kind AS Kind
+          FROM foreach(
+            row={
+          SELECT
+          parse_string_with_regex(
+            regex='^\\s*(?P<Registry>//[^:\\s]+):_?(?P<Kind>authToken|auth|password)\\s*=',
+            string=Line) AS R
+          FROM parse_lines(
+            filename=P)
+        })
+          WHERE R.Registry
+        })
+      
+      LET Pypirc(P) = dict(Repositories={
+          SELECT Section AS Repository,
+                 Field(Body=Body, Key="repository") AS Url,
+                 Field(Body=Body, Key="username") AS Username,
+                 Body =~ '(?m)^\\s*password\\s*=' AS HasPassword
+          FROM IniSections(P=P)
+          WHERE Section != "distutils"
+        })
+      
+      -- A URL with no password part may carry the token as the username,
+      -- so the username is only shown when a separate secret follows it.
+      LET GitCredentials(P) = dict(
+          Entries={
+          SELECT
+          R.Host AS Host,
+          if(condition=R.Secret, then=R.User, else="(token in username)") AS User
+          FROM foreach(
+            row={
+          SELECT
+          parse_string_with_regex(
+            regex='^[a-z+]+://(?P<User>[^:@/]+)(?P<Secret>:[^@]*)?@(?P<Host>[^/\\s]+)',
+            string=Line) AS R
+          FROM parse_lines(
+            filename=P)
+        })
+          WHERE R.Host
+        })
+      
+      LET Gh(Y) = dict(Hosts={
+          SELECT _key AS Host,
+                 _value.user AS User,
+                 format(format="%v", args=[_value]) =~ "oauth_token" AS InlineToken
+          FROM items(item=Y)
+        })
+      
+      LET SshKey(T) = dict(
+          Format=parse_string_with_regex(regex='-----BEGIN (?P<H>[A-Z0-9 ]+)-----',
+                                         string=T).H,
+          Encrypted=T =~ 'ENCRYPTED' OR base64decode(
+            string=parse_string_with_regex(
+              regex='-----BEGIN OPENSSH PRIVATE KEY-----\\s+(?P<B>[A-Za-z0-9+/]{64})',
+              string=T).B) =~ 'bcrypt')
+      
+      LET OwnerName(Id) = SELECT User
+        FROM passwd
+        WHERE Uid = str(str=Id)
+        LIMIT 1
+      
+      LET parsed = SELECT *
+        FROM foreach(row=files,
+                     query={
+          SELECT HomeUsers,
+                 Tool,
+                 Store,
+                 OSPath,
+                 Size,
+                 Mode,
+                 Mtime,
+                 Atime,
+                 Ctime,
+                 Details
+          FROM switch(a={
+          SELECT AwsIni(P=OSPath) AS Details
+          FROM scope()
+          WHERE Parser = "aws_ini"
+        },
+                      b={
+          SELECT AwsJson(J=Json(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "aws_json"
+        },
+                      c={
+          SELECT AzureMsal(J=Json(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "azure_msal"
+        },
+                      d={
+          SELECT AzureLegacy(J=JsonArray(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "azure_legacy"
+        },
+                      e={
+          SELECT AzureProfile(J=Json(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "azure_profile"
+        },
+                      f={
+          SELECT AzureSp(J=JsonArray(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "azure_sp"
+        },
+                      g={
+          SELECT GcloudCredentials(P=OSPath) AS Details
+          FROM scope()
+          WHERE Parser = "gcloud_credentials"
+        },
+                      h={
+          SELECT GcloudTokens(P=OSPath) AS Details
+          FROM scope()
+          WHERE Parser = "gcloud_tokens"
+        },
+                      i={
+          SELECT GcloudAdc(J=Json(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "gcloud_adc"
+        },
+                      j={
+          SELECT Kube(Y=parse_yaml(filename=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "kube"
+        },
+                      k={
+          SELECT Docker(J=Json(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "docker"
+        },
+                      l={
+          SELECT Npmrc(P=OSPath) AS Details
+          FROM scope()
+          WHERE Parser = "npmrc"
+        },
+                      m={
+          SELECT Pypirc(P=OSPath) AS Details
+          FROM scope()
+          WHERE Parser = "pypirc"
+        },
+                      n={
+          SELECT GitCredentials(P=OSPath) AS Details
+          FROM scope()
+          WHERE Parser = "git_credentials"
+        },
+                      o={
+          SELECT Gh(Y=parse_yaml(filename=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "gh"
+        },
+                      p={
+          SELECT SshKey(T=Text(P=OSPath)) AS Details
+          FROM scope()
+          WHERE Parser = "ssh_key"
+        },
+                      z={
+          SELECT dict() AS Details
+          FROM scope()
+        })
+        })
+      
+      SELECT HomeUsers AS User,
+             Tool,
+             Store,
+             OSPath,
+             Size,
+             OwnerName(Id=stat(filename=OSPath).Sys.Uid)[0].User AS Owner,
+             Mode,
+             Mode =~ '^.......r' AS WorldReadable,
+             Mtime,
+             Atime,
+             Ctime,
+             Atime > Mtime AS ReadSinceWrite,
+             Details.Expiry AS TokenExpiry,
+             if(condition=Details.Expiry, then=Details.Expiry > now()) AS TokenLive,
+             Details
+      FROM parsed

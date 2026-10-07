@@ -1,0 +1,228 @@
+name: Custom.Generic.Detection.HarFileTokens
+description: |
+  Finds HTTP Archive (HAR) files that contain live credentials: `Authorization`
+  headers, session cookies, API key headers, and signed-URL parameters.
+
+  HAR files are exported during support troubleshooting ("send us a HAR of
+  the error") and record raw HTTP traffic, including bearer tokens and session
+  cookies in cleartext. Anyone who obtains the file can replay the session
+  without a password or MFA prompt, as in the October 2023 Okta support-system
+  breach. Copies left in `Downloads` or attached to tickets are an
+  unmonitored credential exposure.
+
+  One row per HAR file and host that carried a credential. **Values are never
+  output**: only header names, auth schemes, cookie names and query parameter
+  names. For bearer JWTs, the issuer, subject and expiry are decoded from the
+  token's claims so you can tell which identity and tenant are exposed, and
+  whether the token is still live. Session cookies and opaque tokens have no
+  readable expiry; treat them as live until the session is revoked.
+
+  Chrome 130+ and recent Firefox export *sanitized* HARs by default
+  (no cookies or `Authorization`). Set `ReportClean` to list HAR files with
+  no credentials too.
+
+  #### Response
+  Revoke the sessions and tokens listed (sign-out-everywhere for the
+  `Host`'s identity provider, rotate API keys), then delete the file.
+
+author: liteman
+
+reference:
+  - https://sec.okta.com/harfiles
+  - https://w3c.github.io/web-performance/specs/HAR/Overview.html
+
+type: CLIENT
+
+parameters:
+  - name: HarGlobs
+    type: csv
+    description: Where to look. Searching whole home directories recursively is slow; the defaults cover where browsers save exports.
+    default: |
+      Glob
+      /home/*/{Downloads,Desktop,Documents}/**/*.har
+      /root/{Downloads,Desktop,Documents}/**/*.har
+      /Users/*/{Downloads,Desktop,Documents}/**/*.har
+      /tmp/**/*.har
+      C:/Users/*/{Downloads,Desktop,Documents}/**/*.har
+  - name: SensitiveHeaderRegex
+    type: regex
+    description: Request and response header names that carry credentials.
+    default: (?i)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-amz-security-token|x-goog-api-key|x-functions-key|ocp-apim-subscription-key|private-token)$
+  - name: SensitiveQueryRegex
+    type: regex
+    description: URL query parameter names that carry credentials (OAuth tokens, Azure SAS and AWS presigned signatures).
+    default: (?i)^(access_token|id_token|refresh_token|sig|x-amz-signature|x-amz-security-token|x-goog-signature|api_key|apikey)$
+  - name: MaxSize
+    type: int
+    description: Skip HAR files larger than this many bytes (each file is parsed in memory).
+    default: 200000000
+  - name: ReportClean
+    type: bool
+    description: Also emit one row per HAR file that contains no credentials.
+    default: N
+
+column_types:
+  - name: Mtime
+    type: timestamp
+  - name: FirstSeen
+    type: timestamp
+  - name: LastSeen
+    type: timestamp
+  - name: TokenExpiry
+    type: timestamp
+
+sources:
+  - query: |
+      LET Std(x) = regex_replace(
+          source=regex_replace(source=x, re='-', replace='+'),
+          re='_',
+          replace='/')
+      
+      -- JWT segments are base64url without padding.
+      LET B64Url(x) = base64decode(string=Std(x=x)) || base64decode(
+          string=Std(x=x) + '=') || base64decode(string=Std(x=x) + '==')
+      
+      LET JwtClaims(Token) = parse_json(
+          data=B64Url(x=parse_string_with_regex(
+                        regex='^eyJ[\\w-]*\\.(?P<P>[\\w-]+)\\.',
+                        string=Token).P))
+      
+      LET har_files = SELECT OSPath,
+                             Size,
+                             Mtime
+        FROM glob(globs=HarGlobs.Glob)
+        WHERE NOT IsDir
+         AND if(condition=Size > MaxSize,
+                then=log(message="Skipping %v: %v bytes",
+                         args=[OSPath, Size],
+                         level="WARN")
+                 AND FALSE,
+                else=TRUE)
+      
+      LET entries(Path) = SELECT *
+        FROM foreach(
+          row=parse_json(data=read_file(filename=Path, length=MaxSize)).log.entries)
+      
+      -- One row per credential seen in one entry. Values stay inside this
+      -- query: only names and decoded JWT claims leave it.
+      LET indicators(Path) = SELECT *
+        FROM foreach(
+          row=entries(Path=Path),
+          query={
+          SELECT *
+          FROM chain(
+            headers={
+          SELECT
+          url(parse=request.url).Host AS Host,
+          timestamp(string=startedDateTime) AS Time,
+          format(format="header:%v", args=lowcase(string=name)) AS Indicator,
+          if(condition=name =~ '(?i)authorization$',
+             then=parse_string_with_regex(regex='^(?P<S>\\S+)', string=value).S) AS AuthScheme,
+          if(
+            condition=name =~ '(?i)authorization$',
+            then=JwtClaims(
+              Token=parse_string_with_regex(
+                regex='^\\S+\\s+(?P<T>\\S+)',
+                string=value).T)) AS Claims
+          FROM foreach(
+            row=request.headers + response.headers)
+          WHERE name =~ SensitiveHeaderRegex
+        },
+            cookies={
+          SELECT
+          url(
+            parse=request.url).Host AS Host,
+          timestamp(
+            string=startedDateTime) AS Time,
+          format(
+            format="cookie:%v",
+            args=name) AS Indicator,
+          NULL AS AuthScheme,
+          NULL AS Claims
+          FROM foreach(
+            row=request.cookies + response.cookies)
+        },
+            query={
+          SELECT
+          url(
+            parse=request.url).Host AS Host,
+          timestamp(
+            string=startedDateTime) AS Time,
+          format(
+            format="query:%v",
+            args=split(
+              string=_value,
+              sep='=')[0]) AS Indicator,
+          NULL AS AuthScheme,
+          NULL AS Claims
+          FROM foreach(
+            row=split(
+              string=url(
+                parse=request.url).RawQuery,
+              sep='&'))
+          WHERE split(
+            string=_value,
+            sep='=')[0] =~ SensitiveQueryRegex
+        })
+        })
+      
+      LET per_indicator(Path) = SELECT Host,
+                                       Indicator,
+                                       AuthScheme,
+                                       Claims,
+                                       count() AS Requests,
+                                       min(item=Time) AS FirstSeen,
+                                       max(item=Time) AS LastSeen
+        FROM indicators(Path=Path)
+        GROUP BY Host, Indicator, AuthScheme
+      
+      LET per_host(Path) = SELECT Host,
+                                  enumerate(items=Indicator) AS Indicators,
+                                  filter(list=enumerate(items=AuthScheme),
+                                         condition='x=>x') AS AuthSchemes,
+                                  filter(list=enumerate(items=Claims.iss),
+                                         condition='x=>x') AS JwtIssuer,
+                                  filter(list=enumerate(
+                                           items=Claims.upn ||
+                                             Claims.email ||
+                                             Claims.preferred_username ||
+                                             Claims.sub),
+                                         condition='x=>x') AS JwtSubject,
+                                  min(item=Claims.exp) AS _MinExp,
+                                  sum(item=Requests) AS Occurrences,
+                                  min(item=FirstSeen) AS FirstSeen,
+                                  max(item=LastSeen) AS LastSeen
+        FROM per_indicator(Path=Path)
+        GROUP BY Host
+      
+      LET results <= SELECT *
+        FROM foreach(row=har_files,
+                     query={
+          SELECT
+          OSPath,
+          Size,
+          Mtime,
+          Host,
+          Indicators,
+          AuthSchemes,
+          JwtIssuer,
+          JwtSubject,
+          if(condition=_MinExp, then=timestamp(epoch=_MinExp)) AS TokenExpiry,
+          if(condition=_MinExp, then=_MinExp > now()) AS TokenLive,
+          Occurrences,
+          FirstSeen,
+          LastSeen
+          FROM per_host(Path=OSPath)
+        })
+      
+      LET clean = SELECT OSPath,
+                         Size,
+                         Mtime,
+                         NULL AS Host,
+                         "no credentials found" AS Indicators
+        FROM har_files
+        WHERE ReportClean
+         AND NOT OSPath IN results.OSPath
+      
+      SELECT *
+      FROM chain(a=results, b=clean)
