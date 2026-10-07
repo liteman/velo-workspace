@@ -895,6 +895,44 @@ LET DateAfterTime <= if(condition=DateAfter,
   then=DateAfter, else=timestamp(epoch="1600-01-01"))
 ```
 
+### dedup() Keys on a Column Name
+
+`dedup(key=)` takes a column name, not an expression. Compute the key as a column first:
+
+```sql
+LET opens = SELECT *, format(format="%v|%v", args=[Pid, Path]) AS _Key FROM ...
+SELECT * FROM dedup(query=opens, key="_Key", timeout=60)
+```
+
+### Indexing a Subquery Inside a Function Argument
+
+`{subquery}[0]` and `{subquery}.Field` do not parse inside function arguments or `dict()` values. Wrap the query in a LET function and index the call:
+
+```sql
+LET OwnerOf(U) = SELECT User FROM Users WHERE Uid = U
+SELECT dict(owner=OwnerOf(U=Uid)[0].User) AS Info FROM ...
+```
+
+### LET Function Parameters Shadow Row Columns
+
+A parameter named like a column hides that column inside the function body, so `LET OwnerName(Uid) = SELECT ... WHERE Uid = Uid` matches every row. Give parameters distinct names (`U`, `P`, `Id`).
+
+### switch() Branches Don't See foreach Row Fields via scope()
+
+`SELECT * FROM scope()` inside a `switch()` branch does not carry the enclosing `foreach` row's fields. Return only the computed column from each branch, and select the row's columns by name in the outer query.
+
+### Hidden Aliases Referenced from Another Column
+
+A hidden alias (`_Name`) works in `WHERE`, but can resolve to Null when another column's function call references it. Inline the expression instead.
+
+### Missing Operators and Parsers
+
+- **No `%` modulo operator.**
+- **`base64decode()` rejects unpadded base64url** (JWT segments). Try each padding: `base64decode(string=x) || base64decode(string=x + "=") || base64decode(string=x + "==")`.
+- **No `parse_urlencoded()` in 0.75.5.** Split `url(parse=U).RawQuery` on `&`, then on `=`.
+- **Top-level JSON arrays** need `parse_json_array()`; `parse_json()` expects an object.
+- **`parse_yaml(filename=)` reads a file**, not a string (`data=` returns Null). It handles kubeconfig-style files.
+
 ---
 
 ## 10. Artifact Development Checklist

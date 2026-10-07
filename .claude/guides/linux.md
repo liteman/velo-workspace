@@ -262,6 +262,43 @@ FROM delay(delay=2, query={
 })
 ```
 
+**Kernel-side filtering with `policy=`:** `watch_ebpf()` takes a tracee policy as YAML. Filter in the kernel instead of in `WHERE` for high-volume events like `security_file_open`. Multiple path prefixes go comma-separated in one filter:
+
+```sql
+LET Policy = format(format='''
+metadata:
+  name: token-store-opens
+spec:
+  scope:
+    - global
+  rules:
+    - event: security_file_open
+      filters:
+        - args.pathname=%v
+''', args=PathPrefixes)   -- e.g. "/home/*,/root/*"
+
+SELECT * FROM watch_ebpf(events="security_file_open", policy=Policy)
+WHERE System.HostProcessID != getpid()   -- skip our own opens
+```
+
+eBPF reports some opens twice; `dedup()` on pid and path (see core.md §9, dedup keys on a column name).
+
+**One subscription per policy:** two `watch_ebpf()` calls with the same policy in one artifact means only one receives events. So `fifo()` over an eBPF query alongside the main stream silently gets nothing. Keep windowed state inside the single stream with `lru()` + `set()`:
+
+```sql
+LET Seen <= lru(size=20000)        -- key -> last-seen time
+
+LET recorded = SELECT *, now() AS _Now FROM unique_opens
+  WHERE set(item=Seen, field=format(format="%v|%v", args=[Pid, Tool]), value=now())
+
+LET ToolsSince(Id, Since) = SELECT Tool FROM Tools
+  WHERE get(item=Seen, field=format(format="%v|%v", args=[Id, Tool])) > Since
+
+SELECT *, ToolsSince(Id=Pid, Since=_Now - 60).Tool AS ToolsInWindow FROM recorded
+```
+
+`Linux.Events.TrackProcesses` uses a different event set with no policy and coexists fine. Full working example: `examples/Linux/Events/TokenStoreAccess.yaml`.
+
 ---
 
 ## 7. Package Manager Queries
@@ -464,7 +501,7 @@ WHERE NOT X = "X"  -- Filter header artifacts
 
 | Function/Plugin | Usage | Example |
 |-----------------|-------|---------|
-| `watch_ebpf(events=)` | Subscribe to eBPF kernel events (CLIENT_EVENT) | `FROM watch_ebpf(events="net_packet_dns")` |
+| `watch_ebpf(events=, policy=)` | Subscribe to eBPF kernel events (CLIENT_EVENT); `policy=` filters in-kernel (§6) | `FROM watch_ebpf(events="net_packet_dns")` |
 | `audit()` | Read Linux audit log events | `FROM audit()` |
 
 **File Parsing (Linux-specific):**
@@ -574,6 +611,18 @@ FROM delay(delay=2, query={
   SELECT * FROM watch_ebpf(events="net_packet_dns")
 })
 ```
+
+### glob() Has No Owner on Linux
+
+`glob()` rows carry no owner. Use `stat(filename=OSPath).Sys.Uid` and map it through `/etc/passwd` (§14). `glob()`'s `Globs` column names the pattern that matched; with `root=` set, the pattern has a leading `/`.
+
+### Parsing a File Changes Its atime
+
+Under the default `relatime` mount option, the first read after each write updates atime. A forensic artifact that parses a file erases the "read since last write" signal for every later run. Offer a `ParseContents=N` parameter that collects metadata only, and say so in the description.
+
+### watch_ebpf() Not Verifiable on macOS
+
+The darwin build's `watch_ebpf` stub has no `policy` argument, so `/check` fails there on policy-based artifacts. Verify with a Linux Velociraptor binary.
 
 ### Process Tracker Dependency
 
